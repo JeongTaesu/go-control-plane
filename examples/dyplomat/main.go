@@ -7,8 +7,10 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
@@ -17,6 +19,7 @@ import (
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	router "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
 	hcm "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
+	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 
 	clusterservice "github.com/envoyproxy/go-control-plane/envoy/service/cluster/v3"
 	discoverygrpc "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
@@ -32,6 +35,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
+	wrapperspb "google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 const (
@@ -55,12 +59,24 @@ type Backend struct {
 	Port    uint32 `json:"port"`
 }
 
+type ListenerTLS struct {
+	Enabled              bool     `json:"enabled"`
+	SecretName           string   `json:"secret_name"`
+	SDSPath              string   `json:"sds_path"`
+	WatchedDirectory     string   `json:"watched_directory"`
+	ALPNProtocols        []string `json:"alpn_protocols"`
+	RequireClientCert    bool     `json:"require_client_cert"`
+	ValidationSecretName string   `json:"validation_secret_name,omitempty"`
+	ValidationSDSPath    string   `json:"validation_sds_path,omitempty"`
+}
+
 type ListenerSpec struct {
-	Name      string `json:"name"`
-	Address   string `json:"address"`
-	Port      uint32 `json:"port"`
-	RouteName string `json:"route_name"`
-	Service   string `json:"service"`
+	Name      string       `json:"name"`
+	Address   string       `json:"address"`
+	Port      uint32       `json:"port"`
+	RouteName string       `json:"route_name"`
+	Service   string       `json:"service"`
+	TLS       *ListenerTLS `json:"tls,omitempty"`
 }
 
 type BackendUpsertRequest struct {
@@ -70,11 +86,12 @@ type BackendUpsertRequest struct {
 }
 
 type ListenerUpsertRequest struct {
-	Name      string `json:"name"`
-	Address   string `json:"address"`
-	Port      uint32 `json:"port"`
-	RouteName string `json:"route_name"`
-	Service   string `json:"service"`
+	Name      string       `json:"name"`
+	Address   string       `json:"address"`
+	Port      uint32       `json:"port"`
+	RouteName string       `json:"route_name"`
+	Service   string       `json:"service"`
+	TLS       *ListenerTLS `json:"tls,omitempty"`
 }
 
 type APIResponse struct {
@@ -173,11 +190,12 @@ func clusterUpsertHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	currentVersion := atomic.LoadUint64(&version)
+	created := backends[req.Service]
 	mu.Unlock()
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"message": "cluster upserted",
-		"cluster": backendsCopyOne(req.Service),
+		"cluster": created,
 		"version": currentVersion,
 	})
 }
@@ -197,7 +215,7 @@ func clusterDeleteHandler(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	if _, ok := backends[service]; !ok {
 		mu.Unlock()
-		http.Error(w, "cluster not found", http.StatusNotFound)
+		writeJSON(w, http.StatusNotFound, APIResponse{Message: "cluster not found"})
 		return
 	}
 
@@ -280,6 +298,10 @@ func listenerUpsertHandler(w http.ResponseWriter, r *http.Request) {
 		req.RouteName = "route_" + req.Name
 	}
 
+	if req.TLS != nil && req.TLS.Enabled {
+		normalizeTLS(req.TLS)
+	}
+
 	mu.Lock()
 	if _, ok := backends[req.Service]; !ok {
 		mu.Unlock()
@@ -293,6 +315,7 @@ func listenerUpsertHandler(w http.ResponseWriter, r *http.Request) {
 		Port:      req.Port,
 		RouteName: req.RouteName,
 		Service:   req.Service,
+		TLS:       req.TLS,
 	}
 
 	if err := rebuildSnapshotLocked(); err != nil {
@@ -329,7 +352,7 @@ func listenerDeleteHandler(w http.ResponseWriter, r *http.Request) {
 	listener, ok := listeners[name]
 	if !ok {
 		mu.Unlock()
-		http.Error(w, "listener not found", http.StatusNotFound)
+		writeJSON(w, http.StatusNotFound, APIResponse{Message: "listener not found"})
 		return
 	}
 
@@ -414,7 +437,7 @@ func rebuildSnapshotLocked() error {
 	for _, l := range listeners {
 		routeResources = append(routeResources, buildRoute(l.RouteName, l.Service))
 
-		listenerResource, err := buildListener(l.Name, l.Address, l.Port, l.RouteName)
+		listenerResource, err := buildListener(l)
 		if err != nil {
 			return fmt.Errorf("build listener %q: %w", l.Name, err)
 		}
@@ -462,7 +485,7 @@ func rebuildSnapshotLocked() error {
 func buildCluster(service string) *cluster.Cluster {
 	return &cluster.Cluster{
 		Name:           service,
-		ConnectTimeout: durationpb.New(5),
+		ConnectTimeout: durationpb.New(5 * time.Second),
 		ClusterDiscoveryType: &cluster.Cluster_Type{
 			Type: cluster.Cluster_EDS,
 		},
@@ -535,17 +558,17 @@ func buildRoute(routeName, service string) *routev3.RouteConfiguration {
 	}
 }
 
-func buildListener(name, address string, port uint32, routeName string) (*listenerv3.Listener, error) {
+func buildListener(spec ListenerSpec) (*listenerv3.Listener, error) {
 	routerConfig, err := anypb.New(&router.Router{})
 	if err != nil {
 		return nil, fmt.Errorf("pack router filter: %w", err)
 	}
 
 	manager := &hcm.HttpConnectionManager{
-		StatPrefix: name,
+		StatPrefix: spec.Name,
 		RouteSpecifier: &hcm.HttpConnectionManager_Rds{
 			Rds: &hcm.Rds{
-				RouteConfigName: routeName,
+				RouteConfigName: spec.RouteName,
 				ConfigSource: &core.ConfigSource{
 					ResourceApiVersion: resource.DefaultAPIVersion,
 					ConfigSourceSpecifier: &core.ConfigSource_Ads{
@@ -569,38 +592,130 @@ func buildListener(name, address string, port uint32, routeName string) (*listen
 		return nil, fmt.Errorf("pack http connection manager: %w", err)
 	}
 
+	filterChain := &listenerv3.FilterChain{
+		Filters: []*listenerv3.Filter{
+			{
+				Name: "envoy.filters.network.http_connection_manager",
+				ConfigType: &listenerv3.Filter_TypedConfig{
+					TypedConfig: typedConfig,
+				},
+			},
+		},
+	}
+
+	if spec.TLS != nil && spec.TLS.Enabled {
+		transportSocket, err := buildTLSTransportSocket(*spec.TLS)
+		if err != nil {
+			return nil, err
+		}
+		filterChain.TransportSocket = transportSocket
+	}
+
 	return &listenerv3.Listener{
-		Name: name,
+		Name: spec.Name,
 		Address: &core.Address{
 			Address: &core.Address_SocketAddress{
 				SocketAddress: &core.SocketAddress{
-					Address: address,
+					Address: spec.Address,
 					PortSpecifier: &core.SocketAddress_PortValue{
-						PortValue: port,
+						PortValue: spec.Port,
 					},
 				},
 			},
 		},
-		FilterChains: []*listenerv3.FilterChain{
+		FilterChains: []*listenerv3.FilterChain{filterChain},
+	}, nil
+}
+
+func buildTLSTransportSocket(cfg ListenerTLS) (*core.TransportSocket, error) {
+	normalizeTLS(&cfg)
+
+	common := &tlsv3.CommonTlsContext{
+		AlpnProtocols: cfg.ALPNProtocols,
+		TlsCertificateSdsSecretConfigs: []*tlsv3.SdsSecretConfig{
 			{
-				Filters: []*listenerv3.Filter{
-					{
-						Name: "envoy.filters.network.http_connection_manager",
-						ConfigType: &listenerv3.Filter_TypedConfig{
-							TypedConfig: typedConfig,
-						},
-					},
-				},
+				Name:      cfg.SecretName,
+				SdsConfig: buildPathConfigSource(cfg.SDSPath, cfg.WatchedDirectory),
 			},
+		},
+	}
+
+	if cfg.RequireClientCert {
+		common.ValidationContextType = &tlsv3.CommonTlsContext_ValidationContextSdsSecretConfig{
+			ValidationContextSdsSecretConfig: &tlsv3.SdsSecretConfig{
+				Name: cfg.ValidationSecretName,
+				SdsConfig: buildPathConfigSource(
+					cfg.ValidationSDSPath,
+					watchedDir(cfg.ValidationSDSPath, cfg.WatchedDirectory),
+				),
+			},
+		}
+	}
+
+	downstream := &tlsv3.DownstreamTlsContext{
+		CommonTlsContext: common,
+	}
+
+	if cfg.RequireClientCert {
+		downstream.RequireClientCertificate = &wrapperspb.BoolValue{Value: true}
+	}
+
+	typedConfig, err := anypb.New(downstream)
+	if err != nil {
+		return nil, fmt.Errorf("pack downstream tls context: %w", err)
+	}
+
+	return &core.TransportSocket{
+		Name: "envoy.transport_sockets.tls",
+		ConfigType: &core.TransportSocket_TypedConfig{
+			TypedConfig: typedConfig,
 		},
 	}, nil
 }
 
-func backendsCopyOne(service string) Backend {
-	if b, ok := backends[service]; ok {
-		return b
+func buildPathConfigSource(path, watched string) *core.ConfigSource {
+	return &core.ConfigSource{
+		ResourceApiVersion: resource.DefaultAPIVersion,
+		ConfigSourceSpecifier: &core.ConfigSource_PathConfigSource{
+			PathConfigSource: &core.PathConfigSource{
+				Path: path,
+				WatchedDirectory: &core.WatchedDirectory{
+					Path: watched,
+				},
+			},
+		},
 	}
-	return Backend{}
+}
+
+func normalizeTLS(tls *ListenerTLS) {
+	if tls.SecretName == "" {
+		tls.SecretName = "server_cert"
+	}
+	if tls.SDSPath == "" {
+		tls.SDSPath = "./sds.yaml"
+	}
+	if tls.WatchedDirectory == "" {
+		tls.WatchedDirectory = watchedDir(tls.SDSPath, ".")
+	}
+	if len(tls.ALPNProtocols) == 0 {
+		tls.ALPNProtocols = []string{"h2", "http/1.1"}
+	}
+	if tls.RequireClientCert {
+		if tls.ValidationSecretName == "" {
+			tls.ValidationSecretName = "validation_context"
+		}
+		if tls.ValidationSDSPath == "" {
+			tls.ValidationSDSPath = tls.SDSPath
+		}
+	}
+}
+
+func watchedDir(path, fallback string) string {
+	dir := filepath.Dir(path)
+	if dir == "." || dir == "" {
+		return fallback
+	}
+	return dir
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
