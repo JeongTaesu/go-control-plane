@@ -13,11 +13,15 @@ import (
 	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	endpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
+	listenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	router "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
+	hcm "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 
 	clusterservice "github.com/envoyproxy/go-control-plane/envoy/service/cluster/v3"
 	discoverygrpc "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	endpointservice "github.com/envoyproxy/go-control-plane/envoy/service/endpoint/v3"
+	listenerservice "github.com/envoyproxy/go-control-plane/envoy/service/listener/v3"
 	routeservice "github.com/envoyproxy/go-control-plane/envoy/service/route/v3"
 
 	"github.com/envoyproxy/go-control-plane/pkg/cache/types"
@@ -26,62 +30,83 @@ import (
 	xds "github.com/envoyproxy/go-control-plane/pkg/server/v3"
 
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
 )
 
 const (
 	nodeID        = "local-envoy"
-	defaultIP     = "127.0.0.1"
-	defaultSvc    = "backend_service"
-	defaultPort   = uint32(9090)
 	xdsListenAddr = ":18000"
 	apiListenAddr = ":8081"
 )
 
 var (
 	snapshotCache cache.SnapshotCache
-	version       uint64 = 0
+	version       uint64
 	mu            sync.Mutex
 
-	// 현재 활성 백엔드 상태
-	currentService = defaultSvc
-	currentIP      = defaultIP
-	currentPort    = defaultPort
+	backends  = map[string]Backend{}
+	listeners = map[string]ListenerSpec{}
 )
 
-type BackendUpdateRequest struct {
+type Backend struct {
 	Service string `json:"service"`
 	IP      string `json:"ip"`
 	Port    uint32 `json:"port"`
 }
 
-type BackendUpdateResponse struct {
-	Message string `json:"message"`
+type ListenerSpec struct {
+	Name      string `json:"name"`
+	Address   string `json:"address"`
+	Port      uint32 `json:"port"`
+	RouteName string `json:"route_name"`
+	Service   string `json:"service"`
+}
+
+type BackendUpsertRequest struct {
 	Service string `json:"service"`
 	IP      string `json:"ip"`
 	Port    uint32 `json:"port"`
-	Version uint64 `json:"version"`
+}
+
+type ListenerUpsertRequest struct {
+	Name      string `json:"name"`
+	Address   string `json:"address"`
+	Port      uint32 `json:"port"`
+	RouteName string `json:"route_name"`
+	Service   string `json:"service"`
+}
+
+type APIResponse struct {
+	Message string `json:"message"`
+	Version uint64 `json:"version,omitempty"`
+}
+
+type StateResponse struct {
+	Version   uint64         `json:"version"`
+	Backends  []Backend      `json:"backends"`
+	Listeners []ListenerSpec `json:"listeners"`
 }
 
 func main() {
 	snapshotCache = cache.NewSnapshotCache(false, cache.IDHash{}, nil)
 	server := xds.NewServer(context.Background(), snapshotCache, nil)
 
+	if err := rebuildSnapshot(); err != nil {
+		log.Fatalf("failed to create initial empty snapshot: %v", err)
+	}
+
 	grpcServer := grpc.NewServer()
 	discoverygrpc.RegisterAggregatedDiscoveryServiceServer(grpcServer, server)
 	endpointservice.RegisterEndpointDiscoveryServiceServer(grpcServer, server)
 	clusterservice.RegisterClusterDiscoveryServiceServer(grpcServer, server)
 	routeservice.RegisterRouteDiscoveryServiceServer(grpcServer, server)
+	listenerservice.RegisterListenerDiscoveryServiceServer(grpcServer, server)
 
 	lis, err := net.Listen("tcp", xdsListenAddr)
 	if err != nil {
 		log.Fatalf("failed to listen on %s: %v", xdsListenAddr, err)
 	}
-
-	// // 초기 snapshot
-	// if err := updateBackend(defaultSvc, defaultIP, defaultPort); err != nil {
-	// 	log.Fatalf("failed to push initial snapshot: %v", err)
-	// }
 
 	go startHTTPServer()
 
@@ -93,8 +118,16 @@ func main() {
 
 func startHTTPServer() {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/backend/update", backendUpdateHandler)
-	mux.HandleFunc("/backend/current", backendCurrentHandler)
+
+	mux.HandleFunc("/clusters/upsert", clusterUpsertHandler)
+	mux.HandleFunc("/clusters/delete", clusterDeleteHandler)
+	mux.HandleFunc("/clusters", clustersListHandler)
+
+	mux.HandleFunc("/listeners/upsert", listenerUpsertHandler)
+	mux.HandleFunc("/listeners/delete", listenerDeleteHandler)
+	mux.HandleFunc("/listeners", listenersListHandler)
+
+	mux.HandleFunc("/state", stateHandler)
 
 	log.Printf("REST API listening on %s", apiListenAddr)
 	if err := http.ListenAndServe(apiListenAddr, mux); err != nil {
@@ -102,108 +135,327 @@ func startHTTPServer() {
 	}
 }
 
-func backendUpdateHandler(w http.ResponseWriter, r *http.Request) {
+func clusterUpsertHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		methodNotAllowed(w)
 		return
 	}
 
-	var req BackendUpdateRequest
+	var req BackendUpsertRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid json body: "+err.Error(), http.StatusBadRequest)
+		badRequest(w, "invalid json body: "+err.Error())
 		return
 	}
 
 	if req.Service == "" {
-		http.Error(w, "service required", http.StatusBadRequest)
+		badRequest(w, "service required")
 		return
 	}
 	if req.IP == "" {
-		http.Error(w, "ip required", http.StatusBadRequest)
+		badRequest(w, "ip required")
 		return
 	}
 	if req.Port == 0 {
-		http.Error(w, "port required", http.StatusBadRequest)
+		badRequest(w, "port required")
 		return
 	}
 
-	if err := updateBackend(req.Service, req.IP, req.Port); err != nil {
-		http.Error(w, "failed to update backend: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	resp := BackendUpdateResponse{
-		Message: "backend updated",
+	mu.Lock()
+	backends[req.Service] = Backend{
 		Service: req.Service,
 		IP:      req.IP,
 		Port:    req.Port,
-		Version: atomic.LoadUint64(&version),
 	}
+	if err := rebuildSnapshotLocked(); err != nil {
+		delete(backends, req.Service)
+		mu.Unlock()
+		internalError(w, "failed to rebuild snapshot: "+err.Error())
+		return
+	}
+	currentVersion := atomic.LoadUint64(&version)
+	mu.Unlock()
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(resp)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"message": "cluster upserted",
+		"cluster": backendsCopyOne(req.Service),
+		"version": currentVersion,
+	})
 }
 
-func backendCurrentHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+func clusterDeleteHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		methodNotAllowed(w)
+		return
+	}
+
+	service := r.URL.Query().Get("service")
+	if service == "" {
+		badRequest(w, "service query parameter required")
 		return
 	}
 
 	mu.Lock()
-	resp := BackendUpdateResponse{
-		Message: "current backend",
-		Service: currentService,
-		IP:      currentIP,
-		Port:    currentPort,
-		Version: atomic.LoadUint64(&version),
+	if _, ok := backends[service]; !ok {
+		mu.Unlock()
+		http.Error(w, "cluster not found", http.StatusNotFound)
+		return
+	}
+
+	for _, l := range listeners {
+		if l.Service == service {
+			mu.Unlock()
+			badRequest(w, fmt.Sprintf("cluster %q is in use by listener %q", service, l.Name))
+			return
+		}
+	}
+
+	deleted := backends[service]
+	delete(backends, service)
+
+	if err := rebuildSnapshotLocked(); err != nil {
+		backends[service] = deleted
+		mu.Unlock()
+		internalError(w, "failed to rebuild snapshot: "+err.Error())
+		return
+	}
+
+	currentVersion := atomic.LoadUint64(&version)
+	mu.Unlock()
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"message": "cluster deleted",
+		"cluster": deleted,
+		"version": currentVersion,
+	})
+}
+
+func clustersListHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+
+	mu.Lock()
+	items := make([]Backend, 0, len(backends))
+	for _, b := range backends {
+		items = append(items, b)
+	}
+	currentVersion := atomic.LoadUint64(&version)
+	mu.Unlock()
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"clusters": items,
+		"version":  currentVersion,
+	})
+}
+
+func listenerUpsertHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+
+	var req ListenerUpsertRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		badRequest(w, "invalid json body: "+err.Error())
+		return
+	}
+
+	if req.Name == "" {
+		badRequest(w, "name required")
+		return
+	}
+	if req.Address == "" {
+		req.Address = "0.0.0.0"
+	}
+	if req.Port == 0 {
+		badRequest(w, "port required")
+		return
+	}
+	if req.Service == "" {
+		badRequest(w, "service required")
+		return
+	}
+	if req.RouteName == "" {
+		req.RouteName = "route_" + req.Name
+	}
+
+	mu.Lock()
+	if _, ok := backends[req.Service]; !ok {
+		mu.Unlock()
+		badRequest(w, fmt.Sprintf("service %q not found", req.Service))
+		return
+	}
+
+	listeners[req.Name] = ListenerSpec{
+		Name:      req.Name,
+		Address:   req.Address,
+		Port:      req.Port,
+		RouteName: req.RouteName,
+		Service:   req.Service,
+	}
+
+	if err := rebuildSnapshotLocked(); err != nil {
+		delete(listeners, req.Name)
+		mu.Unlock()
+		internalError(w, "failed to rebuild snapshot: "+err.Error())
+		return
+	}
+
+	currentVersion := atomic.LoadUint64(&version)
+	created := listeners[req.Name]
+	mu.Unlock()
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"message":  "listener upserted",
+		"listener": created,
+		"version":  currentVersion,
+	})
+}
+
+func listenerDeleteHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		methodNotAllowed(w)
+		return
+	}
+
+	name := r.URL.Query().Get("name")
+	if name == "" {
+		badRequest(w, "name query parameter required")
+		return
+	}
+
+	mu.Lock()
+	listener, ok := listeners[name]
+	if !ok {
+		mu.Unlock()
+		http.Error(w, "listener not found", http.StatusNotFound)
+		return
+	}
+
+	delete(listeners, name)
+	if err := rebuildSnapshotLocked(); err != nil {
+		listeners[name] = listener
+		mu.Unlock()
+		internalError(w, "failed to rebuild snapshot: "+err.Error())
+		return
+	}
+
+	currentVersion := atomic.LoadUint64(&version)
+	mu.Unlock()
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"message":  "listener deleted",
+		"listener": listener,
+		"version":  currentVersion,
+	})
+}
+
+func listenersListHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+
+	mu.Lock()
+	items := make([]ListenerSpec, 0, len(listeners))
+	for _, l := range listeners {
+		items = append(items, l)
+	}
+	currentVersion := atomic.LoadUint64(&version)
+	mu.Unlock()
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"listeners": items,
+		"version":   currentVersion,
+	})
+}
+
+func stateHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+
+	mu.Lock()
+	resp := StateResponse{
+		Version:   atomic.LoadUint64(&version),
+		Backends:  make([]Backend, 0, len(backends)),
+		Listeners: make([]ListenerSpec, 0, len(listeners)),
+	}
+	for _, b := range backends {
+		resp.Backends = append(resp.Backends, b)
+	}
+	for _, l := range listeners {
+		resp.Listeners = append(resp.Listeners, l)
 	}
 	mu.Unlock()
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(resp)
+	writeJSON(w, http.StatusOK, resp)
 }
 
-func updateBackend(service, ip string, port uint32) error {
+func rebuildSnapshot() error {
 	mu.Lock()
 	defer mu.Unlock()
+	return rebuildSnapshotLocked()
+}
 
-	clusterResource := buildCluster(service)
-	endpointResource := buildEndpoint(service, ip, port)
-	routeResource := buildRoute(service)
+func rebuildSnapshotLocked() error {
+	clusterResources := make([]types.Resource, 0, len(backends))
+	endpointResources := make([]types.Resource, 0, len(backends))
+	routeResources := make([]types.Resource, 0, len(listeners))
+	listenerResources := make([]types.Resource, 0, len(listeners))
+
+	for _, b := range backends {
+		clusterResources = append(clusterResources, buildCluster(b.Service))
+		endpointResources = append(endpointResources, buildEndpoint(b.Service, b.IP, b.Port))
+	}
+
+	for _, l := range listeners {
+		routeResources = append(routeResources, buildRoute(l.RouteName, l.Service))
+
+		listenerResource, err := buildListener(l.Name, l.Address, l.Port, l.RouteName)
+		if err != nil {
+			return fmt.Errorf("build listener %q: %w", l.Name, err)
+		}
+		listenerResources = append(listenerResources, listenerResource)
+	}
 
 	nextVersion := atomic.AddUint64(&version, 1)
 
 	snapshot, err := cache.NewSnapshot(
 		fmt.Sprintf("%d", nextVersion),
 		map[resource.Type][]types.Resource{
-			resource.ClusterType:  {clusterResource},
-			resource.EndpointType: {endpointResource},
-			resource.RouteType:    {routeResource},
+			resource.ClusterType:  clusterResources,
+			resource.EndpointType: endpointResources,
+			resource.RouteType:    routeResources,
+			resource.ListenerType: listenerResources,
 		},
 	)
 	if err != nil {
-		atomic.AddUint64(&version, ^uint64(0)) // rollback +1
+		atomic.AddUint64(&version, ^uint64(0))
 		return fmt.Errorf("create snapshot: %w", err)
 	}
 
-	// static listener + RDS 조합에서는 go-control-plane의 Consistent()가
-	// listener reference를 snapshot 안에서 찾지 못해 실패할 수 있음.
-	// 실제 Envoy 반영에는 문제 없으므로 로그만 남기고 진행.
 	if err := snapshot.Consistent(); err != nil {
-		// log.Printf("snapshot inconsistent (ignored for static listener + RDS): %v", err)
+		atomic.AddUint64(&version, ^uint64(0))
+		return fmt.Errorf("snapshot inconsistent: %w", err)
 	}
 
 	if err := snapshotCache.SetSnapshot(context.Background(), nodeID, snapshot); err != nil {
-		atomic.AddUint64(&version, ^uint64(0)) // rollback +1
+		atomic.AddUint64(&version, ^uint64(0))
 		return fmt.Errorf("set snapshot: %w", err)
 	}
 
-	currentService = service
-	currentIP = ip
-	currentPort = port
+	log.Printf(
+		"snapshot pushed: version=%d clusters=%d listeners=%d routes=%d endpoints=%d",
+		nextVersion,
+		len(clusterResources),
+		len(listenerResources),
+		len(routeResources),
+		len(endpointResources),
+	)
 
-	log.Printf("snapshot pushed: version=%d service=%s backend=%s:%d", nextVersion, service, ip, port)
 	return nil
 }
 
@@ -211,11 +463,9 @@ func buildCluster(service string) *cluster.Cluster {
 	return &cluster.Cluster{
 		Name:           service,
 		ConnectTimeout: durationpb.New(5),
-
 		ClusterDiscoveryType: &cluster.Cluster_Type{
 			Type: cluster.Cluster_EDS,
 		},
-
 		EdsClusterConfig: &cluster.Cluster_EdsClusterConfig{
 			EdsConfig: &core.ConfigSource{
 				ResourceApiVersion: resource.DefaultAPIVersion,
@@ -224,7 +474,6 @@ func buildCluster(service string) *cluster.Cluster {
 				},
 			},
 		},
-
 		LbPolicy: cluster.Cluster_ROUND_ROBIN,
 	}
 }
@@ -257,17 +506,13 @@ func buildEndpoint(service, ip string, port uint32) *endpointv3.ClusterLoadAssig
 	}
 }
 
-func buildRoute(service string) *routev3.RouteConfiguration {
+func buildRoute(routeName, service string) *routev3.RouteConfiguration {
 	return &routev3.RouteConfiguration{
-		Name: "local_route",
+		Name: routeName,
 		VirtualHosts: []*routev3.VirtualHost{
 			{
-				Name: "backend",
-				Domains: []string{
-					"*",
-					"localhost",
-					"localhost:8080",
-				},
+				Name:    "backend",
+				Domains: []string{"*"},
 				Routes: []*routev3.Route{
 					{
 						Match: &routev3.RouteMatch{
@@ -281,9 +526,6 @@ func buildRoute(service string) *routev3.RouteConfiguration {
 									Cluster: service,
 								},
 								Timeout: durationpb.New(0),
-								HostRewriteSpecifier: &routev3.RouteAction_HostRewriteLiteral{
-									HostRewriteLiteral: "127.0.0.1",
-								},
 							},
 						},
 					},
@@ -291,4 +533,90 @@ func buildRoute(service string) *routev3.RouteConfiguration {
 			},
 		},
 	}
+}
+
+func buildListener(name, address string, port uint32, routeName string) (*listenerv3.Listener, error) {
+	routerConfig, err := anypb.New(&router.Router{})
+	if err != nil {
+		return nil, fmt.Errorf("pack router filter: %w", err)
+	}
+
+	manager := &hcm.HttpConnectionManager{
+		StatPrefix: name,
+		RouteSpecifier: &hcm.HttpConnectionManager_Rds{
+			Rds: &hcm.Rds{
+				RouteConfigName: routeName,
+				ConfigSource: &core.ConfigSource{
+					ResourceApiVersion: resource.DefaultAPIVersion,
+					ConfigSourceSpecifier: &core.ConfigSource_Ads{
+						Ads: &core.AggregatedConfigSource{},
+					},
+				},
+			},
+		},
+		HttpFilters: []*hcm.HttpFilter{
+			{
+				Name: "envoy.filters.http.router",
+				ConfigType: &hcm.HttpFilter_TypedConfig{
+					TypedConfig: routerConfig,
+				},
+			},
+		},
+	}
+
+	typedConfig, err := anypb.New(manager)
+	if err != nil {
+		return nil, fmt.Errorf("pack http connection manager: %w", err)
+	}
+
+	return &listenerv3.Listener{
+		Name: name,
+		Address: &core.Address{
+			Address: &core.Address_SocketAddress{
+				SocketAddress: &core.SocketAddress{
+					Address: address,
+					PortSpecifier: &core.SocketAddress_PortValue{
+						PortValue: port,
+					},
+				},
+			},
+		},
+		FilterChains: []*listenerv3.FilterChain{
+			{
+				Filters: []*listenerv3.Filter{
+					{
+						Name: "envoy.filters.network.http_connection_manager",
+						ConfigType: &listenerv3.Filter_TypedConfig{
+							TypedConfig: typedConfig,
+						},
+					},
+				},
+			},
+		},
+	}, nil
+}
+
+func backendsCopyOne(service string) Backend {
+	if b, ok := backends[service]; ok {
+		return b
+	}
+	return Backend{}
+}
+
+func writeJSON(w http.ResponseWriter, status int, body any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(body)
+}
+
+func badRequest(w http.ResponseWriter, msg string) {
+	writeJSON(w, http.StatusBadRequest, APIResponse{Message: msg})
+}
+
+func internalError(w http.ResponseWriter, msg string) {
+	writeJSON(w, http.StatusInternalServerError, APIResponse{Message: msg})
+}
+
+func methodNotAllowed(w http.ResponseWriter) {
+	writeJSON(w, http.StatusMethodNotAllowed, APIResponse{Message: "method not allowed"})
 }
