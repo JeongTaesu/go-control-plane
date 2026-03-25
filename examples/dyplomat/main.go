@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -51,12 +52,24 @@ var (
 
 	backends  = map[string]Backend{}
 	listeners = map[string]ListenerSpec{}
+	routesMap = map[string]RouteSpec{}
 )
 
 type Backend struct {
-	Service string `json:"service"`
-	IP      string `json:"ip"`
-	Port    uint32 `json:"port"`
+	Service       string       `json:"service"`
+	Address       string       `json:"address"`
+	Port          uint32       `json:"port"`
+	DiscoveryType string       `json:"discovery_type"`
+	UseHTTP2      bool         `json:"use_http2,omitempty"`
+	UpstreamTLS   *UpstreamTLS `json:"upstream_tls,omitempty"`
+}
+
+type UpstreamTLS struct {
+	Enabled              bool   `json:"enabled"`
+	SNI                  string `json:"sni,omitempty"`
+	AutoHostSNI          bool   `json:"auto_host_sni,omitempty"`
+	AutoSNISANValidation bool   `json:"auto_sni_san_validation,omitempty"`
+	TrustedCAFile        string `json:"trusted_ca_file,omitempty"`
 }
 
 type ListenerTLS struct {
@@ -79,10 +92,26 @@ type ListenerSpec struct {
 	TLS       *ListenerTLS `json:"tls,omitempty"`
 }
 
+type RouteRule struct {
+	Prefix        string `json:"prefix"`
+	Cluster       string `json:"cluster"`
+	PrefixRewrite string `json:"prefix_rewrite,omitempty"`
+}
+
+type RouteSpec struct {
+	RouteName string      `json:"route_name"`
+	Domains   []string    `json:"domains,omitempty"`
+	Rules     []RouteRule `json:"rules"`
+}
+
 type BackendUpsertRequest struct {
-	Service string `json:"service"`
-	IP      string `json:"ip"`
-	Port    uint32 `json:"port"`
+	Service       string       `json:"service"`
+	Address       string       `json:"address,omitempty"`
+	IP            string       `json:"ip,omitempty"`
+	Port          uint32       `json:"port"`
+	DiscoveryType string       `json:"discovery_type,omitempty"`
+	UseHTTP2      bool         `json:"use_http2,omitempty"`
+	UpstreamTLS   *UpstreamTLS `json:"upstream_tls,omitempty"`
 }
 
 type ListenerUpsertRequest struct {
@@ -94,6 +123,12 @@ type ListenerUpsertRequest struct {
 	TLS       *ListenerTLS `json:"tls,omitempty"`
 }
 
+type RouteUpsertRequest struct {
+	RouteName string      `json:"route_name"`
+	Domains   []string    `json:"domains,omitempty"`
+	Rules     []RouteRule `json:"rules"`
+}
+
 type APIResponse struct {
 	Message string `json:"message"`
 	Version uint64 `json:"version,omitempty"`
@@ -103,6 +138,7 @@ type StateResponse struct {
 	Version   uint64         `json:"version"`
 	Backends  []Backend      `json:"backends"`
 	Listeners []ListenerSpec `json:"listeners"`
+	Routes    []RouteSpec    `json:"routes"`
 }
 
 func main() {
@@ -144,6 +180,10 @@ func startHTTPServer() {
 	mux.HandleFunc("/listeners/delete", listenerDeleteHandler)
 	mux.HandleFunc("/listeners", listenersListHandler)
 
+	mux.HandleFunc("/routes/upsert", routeUpsertHandler)
+	mux.HandleFunc("/routes/delete", routeDeleteHandler)
+	mux.HandleFunc("/routes", routesListHandler)
+
 	mux.HandleFunc("/state", stateHandler)
 
 	log.Printf("REST API listening on %s", apiListenAddr)
@@ -168,8 +208,11 @@ func clusterUpsertHandler(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, "service required")
 		return
 	}
-	if req.IP == "" {
-		badRequest(w, "ip required")
+	if req.Address == "" && req.IP != "" {
+		req.Address = req.IP
+	}
+	if req.Address == "" {
+		badRequest(w, "address or ip required")
 		return
 	}
 	if req.Port == 0 {
@@ -177,14 +220,28 @@ func clusterUpsertHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	normalizeBackendRequest(&req)
+	if err := validateBackendRequest(req); err != nil {
+		badRequest(w, err.Error())
+		return
+	}
+
 	mu.Lock()
+	old, hadOld := backends[req.Service]
 	backends[req.Service] = Backend{
-		Service: req.Service,
-		IP:      req.IP,
-		Port:    req.Port,
+		Service:       req.Service,
+		Address:       req.Address,
+		Port:          req.Port,
+		DiscoveryType: req.DiscoveryType,
+		UseHTTP2:      req.UseHTTP2,
+		UpstreamTLS:   req.UpstreamTLS,
 	}
 	if err := rebuildSnapshotLocked(); err != nil {
-		delete(backends, req.Service)
+		if hadOld {
+			backends[req.Service] = old
+		} else {
+			delete(backends, req.Service)
+		}
 		mu.Unlock()
 		internalError(w, "failed to rebuild snapshot: "+err.Error())
 		return
@@ -219,11 +276,23 @@ func clusterDeleteHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	for _, rt := range routesMap {
+		for _, rule := range rt.Rules {
+			if rule.Cluster == service {
+				mu.Unlock()
+				badRequest(w, fmt.Sprintf("cluster %q is in use by route %q", service, rt.RouteName))
+				return
+			}
+		}
+	}
+
 	for _, l := range listeners {
 		if l.Service == service {
-			mu.Unlock()
-			badRequest(w, fmt.Sprintf("cluster %q is in use by listener %q", service, l.Name))
-			return
+			if _, hasCustomRoute := routesMap[l.RouteName]; !hasCustomRoute {
+				mu.Unlock()
+				badRequest(w, fmt.Sprintf("cluster %q is used as default backend by listener %q", service, l.Name))
+				return
+			}
 		}
 	}
 
@@ -299,7 +368,7 @@ func listenerUpsertHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.TLS != nil && req.TLS.Enabled {
-		normalizeTLS(req.TLS)
+		normalizeListenerTLS(req.TLS)
 	}
 
 	mu.Lock()
@@ -309,6 +378,7 @@ func listenerUpsertHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	old, hadOld := listeners[req.Name]
 	listeners[req.Name] = ListenerSpec{
 		Name:      req.Name,
 		Address:   req.Address,
@@ -319,7 +389,11 @@ func listenerUpsertHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := rebuildSnapshotLocked(); err != nil {
-		delete(listeners, req.Name)
+		if hadOld {
+			listeners[req.Name] = old
+		} else {
+			delete(listeners, req.Name)
+		}
 		mu.Unlock()
 		internalError(w, "failed to rebuild snapshot: "+err.Error())
 		return
@@ -394,6 +468,135 @@ func listenersListHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func routeUpsertHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+
+	var req RouteUpsertRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		badRequest(w, "invalid json body: "+err.Error())
+		return
+	}
+	if req.RouteName == "" {
+		badRequest(w, "route_name required")
+		return
+	}
+	if len(req.Rules) == 0 {
+		badRequest(w, "at least one route rule required")
+		return
+	}
+	if len(req.Domains) == 0 {
+		req.Domains = []string{"*"}
+	}
+
+	mu.Lock()
+	for i, rule := range req.Rules {
+		if rule.Prefix == "" {
+			mu.Unlock()
+			badRequest(w, fmt.Sprintf("rules[%d].prefix required", i))
+			return
+		}
+		if rule.Cluster == "" {
+			mu.Unlock()
+			badRequest(w, fmt.Sprintf("rules[%d].cluster required", i))
+			return
+		}
+		if _, ok := backends[rule.Cluster]; !ok {
+			mu.Unlock()
+			badRequest(w, fmt.Sprintf("rules[%d].cluster %q not found", i, rule.Cluster))
+			return
+		}
+	}
+
+	old, hadOld := routesMap[req.RouteName]
+	routesMap[req.RouteName] = RouteSpec{
+		RouteName: req.RouteName,
+		Domains:   req.Domains,
+		Rules:     req.Rules,
+	}
+
+	if err := rebuildSnapshotLocked(); err != nil {
+		if hadOld {
+			routesMap[req.RouteName] = old
+		} else {
+			delete(routesMap, req.RouteName)
+		}
+		mu.Unlock()
+		internalError(w, "failed to rebuild snapshot: "+err.Error())
+		return
+	}
+
+	currentVersion := atomic.LoadUint64(&version)
+	created := routesMap[req.RouteName]
+	mu.Unlock()
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"message": "route upserted",
+		"route":   created,
+		"version": currentVersion,
+	})
+}
+
+func routeDeleteHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		methodNotAllowed(w)
+		return
+	}
+
+	routeName := r.URL.Query().Get("route_name")
+	if routeName == "" {
+		badRequest(w, "route_name query parameter required")
+		return
+	}
+
+	mu.Lock()
+	rt, ok := routesMap[routeName]
+	if !ok {
+		mu.Unlock()
+		writeJSON(w, http.StatusNotFound, APIResponse{Message: "route not found"})
+		return
+	}
+
+	delete(routesMap, routeName)
+	if err := rebuildSnapshotLocked(); err != nil {
+		routesMap[routeName] = rt
+		mu.Unlock()
+		internalError(w, "failed to rebuild snapshot: "+err.Error())
+		return
+	}
+
+	currentVersion := atomic.LoadUint64(&version)
+	mu.Unlock()
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"message": "route deleted",
+		"route":   rt,
+		"version": currentVersion,
+	})
+}
+
+func routesListHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+
+	mu.Lock()
+	items := make([]RouteSpec, 0, len(routesMap))
+	for _, rt := range routesMap {
+		items = append(items, rt)
+	}
+	currentVersion := atomic.LoadUint64(&version)
+	mu.Unlock()
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"routes":  items,
+		"version": currentVersion,
+	})
+}
+
 func stateHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		methodNotAllowed(w)
@@ -405,12 +608,16 @@ func stateHandler(w http.ResponseWriter, r *http.Request) {
 		Version:   atomic.LoadUint64(&version),
 		Backends:  make([]Backend, 0, len(backends)),
 		Listeners: make([]ListenerSpec, 0, len(listeners)),
+		Routes:    make([]RouteSpec, 0, len(routesMap)),
 	}
 	for _, b := range backends {
 		resp.Backends = append(resp.Backends, b)
 	}
 	for _, l := range listeners {
 		resp.Listeners = append(resp.Listeners, l)
+	}
+	for _, rt := range routesMap {
+		resp.Routes = append(resp.Routes, rt)
 	}
 	mu.Unlock()
 
@@ -426,16 +633,26 @@ func rebuildSnapshot() error {
 func rebuildSnapshotLocked() error {
 	clusterResources := make([]types.Resource, 0, len(backends))
 	endpointResources := make([]types.Resource, 0, len(backends))
-	routeResources := make([]types.Resource, 0, len(listeners))
+	routeResources := make([]types.Resource, 0, len(listeners)+len(routesMap))
 	listenerResources := make([]types.Resource, 0, len(listeners))
 
 	for _, b := range backends {
-		clusterResources = append(clusterResources, buildCluster(b.Service))
-		endpointResources = append(endpointResources, buildEndpoint(b.Service, b.IP, b.Port))
+		clusterResource, endpointResource, err := buildClusterAndEndpoint(b)
+		if err != nil {
+			return fmt.Errorf("build cluster %q: %w", b.Service, err)
+		}
+		clusterResources = append(clusterResources, clusterResource)
+		if endpointResource != nil {
+			endpointResources = append(endpointResources, endpointResource)
+		}
 	}
 
+	seenRoutes := map[string]bool{}
 	for _, l := range listeners {
-		routeResources = append(routeResources, buildRoute(l.RouteName, l.Service))
+		if !seenRoutes[l.RouteName] {
+			routeResources = append(routeResources, buildRouteForListener(l))
+			seenRoutes[l.RouteName] = true
+		}
 
 		listenerResource, err := buildListener(l)
 		if err != nil {
@@ -482,26 +699,89 @@ func rebuildSnapshotLocked() error {
 	return nil
 }
 
-func buildCluster(service string) *cluster.Cluster {
-	return &cluster.Cluster{
-		Name:           service,
+func buildClusterAndEndpoint(b Backend) (*cluster.Cluster, *endpointv3.ClusterLoadAssignment, error) {
+	clusterResource := &cluster.Cluster{
+		Name:           b.Service,
 		ConnectTimeout: durationpb.New(5 * time.Second),
-		ClusterDiscoveryType: &cluster.Cluster_Type{
+		LbPolicy:       cluster.Cluster_ROUND_ROBIN,
+	}
+
+	if b.UseHTTP2 {
+		clusterResource.Http2ProtocolOptions = &core.Http2ProtocolOptions{}
+	}
+
+	if b.UpstreamTLS != nil && b.UpstreamTLS.Enabled {
+		transportSocket, err := buildUpstreamTLSTransportSocket(*b.UpstreamTLS)
+		if err != nil {
+			return nil, nil, err
+		}
+		clusterResource.TransportSocket = transportSocket
+	}
+
+	switch b.DiscoveryType {
+	case "EDS":
+		clusterResource.ClusterDiscoveryType = &cluster.Cluster_Type{
 			Type: cluster.Cluster_EDS,
-		},
-		EdsClusterConfig: &cluster.Cluster_EdsClusterConfig{
+		}
+		clusterResource.EdsClusterConfig = &cluster.Cluster_EdsClusterConfig{
 			EdsConfig: &core.ConfigSource{
 				ResourceApiVersion: resource.DefaultAPIVersion,
 				ConfigSourceSpecifier: &core.ConfigSource_Ads{
 					Ads: &core.AggregatedConfigSource{},
 				},
 			},
-		},
-		LbPolicy: cluster.Cluster_ROUND_ROBIN,
+		}
+		return clusterResource, buildEndpoint(b.Service, b.Address, b.Port), nil
+
+	case "LOGICAL_DNS":
+		clusterResource.ClusterDiscoveryType = &cluster.Cluster_Type{
+			Type: cluster.Cluster_LOGICAL_DNS,
+		}
+		clusterResource.LoadAssignment = buildEndpoint(b.Service, b.Address, b.Port)
+		return clusterResource, nil, nil
+
+	default:
+		return nil, nil, fmt.Errorf("unsupported discovery_type %q", b.DiscoveryType)
 	}
 }
 
-func buildEndpoint(service, ip string, port uint32) *endpointv3.ClusterLoadAssignment {
+func buildUpstreamTLSTransportSocket(cfg UpstreamTLS) (*core.TransportSocket, error) {
+	upstream := &tlsv3.UpstreamTlsContext{
+		CommonTlsContext: &tlsv3.CommonTlsContext{},
+	}
+
+	if cfg.SNI != "" {
+		upstream.Sni = cfg.SNI
+	}
+	upstream.AutoHostSni = cfg.AutoHostSNI
+	upstream.AutoSniSanValidation = cfg.AutoSNISANValidation
+
+	if cfg.TrustedCAFile != "" {
+		upstream.CommonTlsContext.ValidationContextType = &tlsv3.CommonTlsContext_ValidationContext{
+			ValidationContext: &tlsv3.CertificateValidationContext{
+				TrustedCa: &core.DataSource{
+					Specifier: &core.DataSource_Filename{
+						Filename: cfg.TrustedCAFile,
+					},
+				},
+			},
+		}
+	}
+
+	typedConfig, err := anypb.New(upstream)
+	if err != nil {
+		return nil, fmt.Errorf("pack upstream tls context: %w", err)
+	}
+
+	return &core.TransportSocket{
+		Name: "envoy.transport_sockets.tls",
+		ConfigType: &core.TransportSocket_TypedConfig{
+			TypedConfig: typedConfig,
+		},
+	}, nil
+}
+
+func buildEndpoint(service, address string, port uint32) *endpointv3.ClusterLoadAssignment {
 	return &endpointv3.ClusterLoadAssignment{
 		ClusterName: service,
 		Endpoints: []*endpointv3.LocalityLbEndpoints{
@@ -513,7 +793,7 @@ func buildEndpoint(service, ip string, port uint32) *endpointv3.ClusterLoadAssig
 								Address: &core.Address{
 									Address: &core.Address_SocketAddress{
 										SocketAddress: &core.SocketAddress{
-											Address: ip,
+											Address: address,
 											PortSpecifier: &core.SocketAddress_PortValue{
 												PortValue: port,
 											},
@@ -529,9 +809,13 @@ func buildEndpoint(service, ip string, port uint32) *endpointv3.ClusterLoadAssig
 	}
 }
 
-func buildRoute(routeName, service string) *routev3.RouteConfiguration {
+func buildRouteForListener(listener ListenerSpec) *routev3.RouteConfiguration {
+	if custom, ok := routesMap[listener.RouteName]; ok {
+		return buildRouteFromSpec(custom)
+	}
+
 	return &routev3.RouteConfiguration{
-		Name: routeName,
+		Name: listener.RouteName,
 		VirtualHosts: []*routev3.VirtualHost{
 			{
 				Name:    "backend",
@@ -539,20 +823,52 @@ func buildRoute(routeName, service string) *routev3.RouteConfiguration {
 				Routes: []*routev3.Route{
 					{
 						Match: &routev3.RouteMatch{
-							PathSpecifier: &routev3.RouteMatch_Prefix{
-								Prefix: "/",
-							},
+							PathSpecifier: &routev3.RouteMatch_Prefix{Prefix: "/"},
 						},
 						Action: &routev3.Route_Route{
 							Route: &routev3.RouteAction{
-								ClusterSpecifier: &routev3.RouteAction_Cluster{
-									Cluster: service,
-								},
-								Timeout: durationpb.New(0),
+								ClusterSpecifier: &routev3.RouteAction_Cluster{Cluster: listener.Service},
+								Timeout:          durationpb.New(0),
 							},
 						},
 					},
 				},
+			},
+		},
+	}
+}
+
+func buildRouteFromSpec(spec RouteSpec) *routev3.RouteConfiguration {
+	domains := spec.Domains
+	if len(domains) == 0 {
+		domains = []string{"*"}
+	}
+
+	routes := make([]*routev3.Route, 0, len(spec.Rules))
+	for _, rule := range spec.Rules {
+		action := &routev3.RouteAction{
+			ClusterSpecifier: &routev3.RouteAction_Cluster{Cluster: rule.Cluster},
+			Timeout:          durationpb.New(0),
+		}
+		if rule.PrefixRewrite != "" {
+			action.PrefixRewrite = rule.PrefixRewrite
+		}
+
+		routes = append(routes, &routev3.Route{
+			Match: &routev3.RouteMatch{
+				PathSpecifier: &routev3.RouteMatch_Prefix{Prefix: rule.Prefix},
+			},
+			Action: &routev3.Route_Route{Route: action},
+		})
+	}
+
+	return &routev3.RouteConfiguration{
+		Name: spec.RouteName,
+		VirtualHosts: []*routev3.VirtualHost{
+			{
+				Name:    "backend",
+				Domains: domains,
+				Routes:  routes,
 			},
 		},
 	}
@@ -579,10 +895,8 @@ func buildListener(spec ListenerSpec) (*listenerv3.Listener, error) {
 		},
 		HttpFilters: []*hcm.HttpFilter{
 			{
-				Name: "envoy.filters.http.router",
-				ConfigType: &hcm.HttpFilter_TypedConfig{
-					TypedConfig: routerConfig,
-				},
+				Name:       "envoy.filters.http.router",
+				ConfigType: &hcm.HttpFilter_TypedConfig{TypedConfig: routerConfig},
 			},
 		},
 	}
@@ -595,16 +909,14 @@ func buildListener(spec ListenerSpec) (*listenerv3.Listener, error) {
 	filterChain := &listenerv3.FilterChain{
 		Filters: []*listenerv3.Filter{
 			{
-				Name: "envoy.filters.network.http_connection_manager",
-				ConfigType: &listenerv3.Filter_TypedConfig{
-					TypedConfig: typedConfig,
-				},
+				Name:       "envoy.filters.network.http_connection_manager",
+				ConfigType: &listenerv3.Filter_TypedConfig{TypedConfig: typedConfig},
 			},
 		},
 	}
 
 	if spec.TLS != nil && spec.TLS.Enabled {
-		transportSocket, err := buildTLSTransportSocket(*spec.TLS)
+		transportSocket, err := buildDownstreamTLSTransportSocket(*spec.TLS)
 		if err != nil {
 			return nil, err
 		}
@@ -616,10 +928,8 @@ func buildListener(spec ListenerSpec) (*listenerv3.Listener, error) {
 		Address: &core.Address{
 			Address: &core.Address_SocketAddress{
 				SocketAddress: &core.SocketAddress{
-					Address: spec.Address,
-					PortSpecifier: &core.SocketAddress_PortValue{
-						PortValue: spec.Port,
-					},
+					Address:       spec.Address,
+					PortSpecifier: &core.SocketAddress_PortValue{PortValue: spec.Port},
 				},
 			},
 		},
@@ -627,8 +937,8 @@ func buildListener(spec ListenerSpec) (*listenerv3.Listener, error) {
 	}, nil
 }
 
-func buildTLSTransportSocket(cfg ListenerTLS) (*core.TransportSocket, error) {
-	normalizeTLS(&cfg)
+func buildDownstreamTLSTransportSocket(cfg ListenerTLS) (*core.TransportSocket, error) {
+	normalizeListenerTLS(&cfg)
 
 	common := &tlsv3.CommonTlsContext{
 		AlpnProtocols: cfg.ALPNProtocols,
@@ -652,10 +962,7 @@ func buildTLSTransportSocket(cfg ListenerTLS) (*core.TransportSocket, error) {
 		}
 	}
 
-	downstream := &tlsv3.DownstreamTlsContext{
-		CommonTlsContext: common,
-	}
-
+	downstream := &tlsv3.DownstreamTlsContext{CommonTlsContext: common}
 	if cfg.RequireClientCert {
 		downstream.RequireClientCertificate = &wrapperspb.BoolValue{Value: true}
 	}
@@ -678,16 +985,48 @@ func buildPathConfigSource(path, watched string) *core.ConfigSource {
 		ResourceApiVersion: resource.DefaultAPIVersion,
 		ConfigSourceSpecifier: &core.ConfigSource_PathConfigSource{
 			PathConfigSource: &core.PathConfigSource{
-				Path: path,
-				WatchedDirectory: &core.WatchedDirectory{
-					Path: watched,
-				},
+				Path:             path,
+				WatchedDirectory: &core.WatchedDirectory{Path: watched},
 			},
 		},
 	}
 }
 
-func normalizeTLS(tls *ListenerTLS) {
+func normalizeBackendRequest(req *BackendUpsertRequest) {
+	req.DiscoveryType = strings.ToUpper(strings.TrimSpace(req.DiscoveryType))
+	if req.DiscoveryType == "" {
+		if net.ParseIP(req.Address) != nil {
+			req.DiscoveryType = "EDS"
+		} else {
+			req.DiscoveryType = "LOGICAL_DNS"
+		}
+	}
+
+	if req.UpstreamTLS != nil && req.UpstreamTLS.Enabled {
+		if req.UpstreamTLS.SNI == "" && net.ParseIP(req.Address) == nil {
+			req.UpstreamTLS.SNI = req.Address
+		}
+		if net.ParseIP(req.Address) == nil {
+			req.UpstreamTLS.AutoHostSNI = true
+		}
+	}
+}
+
+func validateBackendRequest(req BackendUpsertRequest) error {
+	switch req.DiscoveryType {
+	case "EDS":
+		if net.ParseIP(req.Address) == nil {
+			return fmt.Errorf("EDS clusters require an IP address, got %q", req.Address)
+		}
+	case "LOGICAL_DNS":
+		// hostname or IP both work here
+	default:
+		return fmt.Errorf("discovery_type must be EDS or LOGICAL_DNS")
+	}
+	return nil
+}
+
+func normalizeListenerTLS(tls *ListenerTLS) {
 	if tls.SecretName == "" {
 		tls.SecretName = "server_cert"
 	}
