@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,6 +22,7 @@ import (
 	router "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
 	hcm "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
+	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 
 	clusterservice "github.com/envoyproxy/go-control-plane/envoy/service/cluster/v3"
 	discoverygrpc "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
@@ -50,18 +52,16 @@ var (
 	version       uint64
 	mu            sync.Mutex
 
-	backends  = map[string]Backend{}
-	listeners = map[string]ListenerSpec{}
-	routesMap = map[string]RouteSpec{}
+	backends     = map[string]Backend{}
+	listeners    = map[string]ListenerSpec{}
+	routeConfigs = map[string]RouteConfigSpec{}
 )
 
-type Backend struct {
-	Service       string       `json:"service"`
-	Address       string       `json:"address"`
-	Port          uint32       `json:"port"`
-	DiscoveryType string       `json:"discovery_type"`
-	UseHTTP2      bool         `json:"use_http2,omitempty"`
-	UpstreamTLS   *UpstreamTLS `json:"upstream_tls,omitempty"`
+type BackendEndpoint struct {
+	Address  string `json:"address"`
+	Port     uint32 `json:"port"`
+	Weight   uint32 `json:"weight,omitempty"`
+	Priority uint32 `json:"priority,omitempty"`
 }
 
 type UpstreamTLS struct {
@@ -70,6 +70,60 @@ type UpstreamTLS struct {
 	AutoHostSNI          bool   `json:"auto_host_sni,omitempty"`
 	AutoSNISANValidation bool   `json:"auto_sni_san_validation,omitempty"`
 	TrustedCAFile        string `json:"trusted_ca_file,omitempty"`
+	ClientCertFile       string `json:"client_cert_file,omitempty"`
+	ClientKeyFile        string `json:"client_key_file,omitempty"`
+}
+
+type HealthCheckSpec struct {
+	Type               string `json:"type"`
+	Path               string `json:"path,omitempty"`
+	Host               string `json:"host,omitempty"`
+	TimeoutMS          uint32 `json:"timeout_ms,omitempty"`
+	IntervalMS         uint32 `json:"interval_ms,omitempty"`
+	HealthyThreshold   uint32 `json:"healthy_threshold,omitempty"`
+	UnhealthyThreshold uint32 `json:"unhealthy_threshold,omitempty"`
+}
+
+type OutlierDetectionSpec struct {
+	Consecutive5xx uint32 `json:"consecutive_5xx,omitempty"`
+	IntervalMS     uint32 `json:"interval_ms,omitempty"`
+	BaseEjectionMS uint32 `json:"base_ejection_time_ms,omitempty"`
+	MaxEjectionPct uint32 `json:"max_ejection_percent,omitempty"`
+}
+
+type CircuitBreakersThresholdSpec struct {
+	Priority            string `json:"priority,omitempty"`
+	MaxConnections      uint32 `json:"max_connections,omitempty"`
+	MaxPendingRequests  uint32 `json:"max_pending_requests,omitempty"`
+	MaxRequests         uint32 `json:"max_requests,omitempty"`
+	MaxRetries          uint32 `json:"max_retries,omitempty"`
+	MaxConnectionPools  uint32 `json:"max_connection_pools,omitempty"`
+	RetryBudgetPercent  uint32 `json:"retry_budget_percent,omitempty"`
+	MinRetryConcurrency uint32 `json:"min_retry_concurrency,omitempty"`
+	TrackRemaining      bool   `json:"track_remaining,omitempty"`
+}
+
+type RetryPolicySpec struct {
+	RetryOn                       string   `json:"retry_on,omitempty"`
+	NumRetries                    uint32   `json:"num_retries,omitempty"`
+	PerTryTimeoutMS               uint32   `json:"per_try_timeout_ms,omitempty"`
+	RetriableStatusCodes          []uint32 `json:"retriable_status_codes,omitempty"`
+	HostSelectionRetryMaxAttempts uint32   `json:"host_selection_retry_max_attempts,omitempty"`
+}
+
+type Backend struct {
+	Service          string                         `json:"service"`
+	Address          string                         `json:"address,omitempty"`
+	IP               string                         `json:"ip,omitempty"`
+	Port             uint32                         `json:"port,omitempty"`
+	DiscoveryType    string                         `json:"discovery_type,omitempty"`
+	Endpoints        []BackendEndpoint              `json:"endpoints,omitempty"`
+	LBPolicy         string                         `json:"lb_policy,omitempty"`
+	UseHTTP2         bool                           `json:"use_http2,omitempty"`
+	UpstreamTLS      *UpstreamTLS                   `json:"upstream_tls,omitempty"`
+	HealthCheck      *HealthCheckSpec               `json:"health_check,omitempty"`
+	OutlierDetection *OutlierDetectionSpec          `json:"outlier_detection,omitempty"`
+	CircuitBreakers  []CircuitBreakersThresholdSpec `json:"circuit_breakers,omitempty"`
 }
 
 type ListenerTLS struct {
@@ -93,41 +147,23 @@ type ListenerSpec struct {
 }
 
 type RouteRule struct {
-	Prefix        string `json:"prefix"`
-	Cluster       string `json:"cluster"`
-	PrefixRewrite string `json:"prefix_rewrite,omitempty"`
+	Prefix             string           `json:"prefix"`
+	Cluster            string           `json:"cluster"`
+	PrefixRewrite      string           `json:"prefix_rewrite,omitempty"`
+	HostRewriteLiteral string           `json:"host_rewrite_literal,omitempty"`
+	TimeoutMS          uint32           `json:"timeout_ms,omitempty"`
+	RetryPolicy        *RetryPolicySpec `json:"retry_policy,omitempty"`
 }
 
-type RouteSpec struct {
+type RouteConfigSpec struct {
 	RouteName string      `json:"route_name"`
 	Domains   []string    `json:"domains,omitempty"`
 	Rules     []RouteRule `json:"rules"`
 }
 
-type BackendUpsertRequest struct {
-	Service       string       `json:"service"`
-	Address       string       `json:"address,omitempty"`
-	IP            string       `json:"ip,omitempty"`
-	Port          uint32       `json:"port"`
-	DiscoveryType string       `json:"discovery_type,omitempty"`
-	UseHTTP2      bool         `json:"use_http2,omitempty"`
-	UpstreamTLS   *UpstreamTLS `json:"upstream_tls,omitempty"`
-}
-
-type ListenerUpsertRequest struct {
-	Name      string       `json:"name"`
-	Address   string       `json:"address"`
-	Port      uint32       `json:"port"`
-	RouteName string       `json:"route_name"`
-	Service   string       `json:"service"`
-	TLS       *ListenerTLS `json:"tls,omitempty"`
-}
-
-type RouteUpsertRequest struct {
-	RouteName string      `json:"route_name"`
-	Domains   []string    `json:"domains,omitempty"`
-	Rules     []RouteRule `json:"rules"`
-}
+type BackendUpsertRequest = Backend
+type ListenerUpsertRequest = ListenerSpec
+type RouteUpsertRequest = RouteConfigSpec
 
 type APIResponse struct {
 	Message string `json:"message"`
@@ -135,10 +171,10 @@ type APIResponse struct {
 }
 
 type StateResponse struct {
-	Version   uint64         `json:"version"`
-	Backends  []Backend      `json:"backends"`
-	Listeners []ListenerSpec `json:"listeners"`
-	Routes    []RouteSpec    `json:"routes"`
+	Version      uint64            `json:"version"`
+	Backends     []Backend         `json:"backends"`
+	Listeners    []ListenerSpec    `json:"listeners"`
+	RouteConfigs []RouteConfigSpec `json:"route_configs"`
 }
 
 func main() {
@@ -204,55 +240,33 @@ func clusterUpsertHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Service == "" {
-		badRequest(w, "service required")
-		return
-	}
-	if req.Address == "" && req.IP != "" {
-		req.Address = req.IP
-	}
-	if req.Address == "" {
-		badRequest(w, "address or ip required")
-		return
-	}
-	if req.Port == 0 {
-		badRequest(w, "port required")
-		return
-	}
-
-	normalizeBackendRequest(&req)
-	if err := validateBackendRequest(req); err != nil {
+	backend, err := normalizeBackend(req)
+	if err != nil {
 		badRequest(w, err.Error())
 		return
 	}
 
 	mu.Lock()
-	old, hadOld := backends[req.Service]
-	backends[req.Service] = Backend{
-		Service:       req.Service,
-		Address:       req.Address,
-		Port:          req.Port,
-		DiscoveryType: req.DiscoveryType,
-		UseHTTP2:      req.UseHTTP2,
-		UpstreamTLS:   req.UpstreamTLS,
-	}
+	prev, hadPrev := backends[backend.Service]
+	backends[backend.Service] = backend
+
 	if err := rebuildSnapshotLocked(); err != nil {
-		if hadOld {
-			backends[req.Service] = old
+		if hadPrev {
+			backends[backend.Service] = prev
 		} else {
-			delete(backends, req.Service)
+			delete(backends, backend.Service)
 		}
 		mu.Unlock()
 		internalError(w, "failed to rebuild snapshot: "+err.Error())
 		return
 	}
+
 	currentVersion := atomic.LoadUint64(&version)
-	created := backends[req.Service]
 	mu.Unlock()
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"message": "cluster upserted",
-		"cluster": created,
+		"cluster": backend,
 		"version": currentVersion,
 	})
 }
@@ -270,37 +284,33 @@ func clusterDeleteHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	mu.Lock()
-	if _, ok := backends[service]; !ok {
+	backend, ok := backends[service]
+	if !ok {
 		mu.Unlock()
 		writeJSON(w, http.StatusNotFound, APIResponse{Message: "cluster not found"})
 		return
 	}
 
-	for _, rt := range routesMap {
-		for _, rule := range rt.Rules {
-			if rule.Cluster == service {
-				mu.Unlock()
-				badRequest(w, fmt.Sprintf("cluster %q is in use by route %q", service, rt.RouteName))
-				return
-			}
-		}
-	}
-
 	for _, l := range listeners {
 		if l.Service == service {
-			if _, hasCustomRoute := routesMap[l.RouteName]; !hasCustomRoute {
+			mu.Unlock()
+			badRequest(w, fmt.Sprintf("cluster %q is in use by listener %q", service, l.Name))
+			return
+		}
+	}
+	for _, rc := range routeConfigs {
+		for _, rule := range rc.Rules {
+			if rule.Cluster == service {
 				mu.Unlock()
-				badRequest(w, fmt.Sprintf("cluster %q is used as default backend by listener %q", service, l.Name))
+				badRequest(w, fmt.Sprintf("cluster %q is in use by route %q", service, rc.RouteName))
 				return
 			}
 		}
 	}
 
-	deleted := backends[service]
 	delete(backends, service)
-
 	if err := rebuildSnapshotLocked(); err != nil {
-		backends[service] = deleted
+		backends[service] = backend
 		mu.Unlock()
 		internalError(w, "failed to rebuild snapshot: "+err.Error())
 		return
@@ -311,7 +321,7 @@ func clusterDeleteHandler(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"message": "cluster deleted",
-		"cluster": deleted,
+		"cluster": backend,
 		"version": currentVersion,
 	})
 }
@@ -327,6 +337,7 @@ func clustersListHandler(w http.ResponseWriter, r *http.Request) {
 	for _, b := range backends {
 		items = append(items, b)
 	}
+	sort.Slice(items, func(i, j int) bool { return items[i].Service < items[j].Service })
 	currentVersion := atomic.LoadUint64(&version)
 	mu.Unlock()
 
@@ -359,14 +370,13 @@ func listenerUpsertHandler(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, "port required")
 		return
 	}
+	if req.RouteName == "" {
+		req.RouteName = "route_" + req.Name
+	}
 	if req.Service == "" {
 		badRequest(w, "service required")
 		return
 	}
-	if req.RouteName == "" {
-		req.RouteName = "route_" + req.Name
-	}
-
 	if req.TLS != nil && req.TLS.Enabled {
 		normalizeListenerTLS(req.TLS)
 	}
@@ -378,19 +388,11 @@ func listenerUpsertHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	old, hadOld := listeners[req.Name]
-	listeners[req.Name] = ListenerSpec{
-		Name:      req.Name,
-		Address:   req.Address,
-		Port:      req.Port,
-		RouteName: req.RouteName,
-		Service:   req.Service,
-		TLS:       req.TLS,
-	}
-
+	prev, hadPrev := listeners[req.Name]
+	listeners[req.Name] = req
 	if err := rebuildSnapshotLocked(); err != nil {
-		if hadOld {
-			listeners[req.Name] = old
+		if hadPrev {
+			listeners[req.Name] = prev
 		} else {
 			delete(listeners, req.Name)
 		}
@@ -400,12 +402,11 @@ func listenerUpsertHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	currentVersion := atomic.LoadUint64(&version)
-	created := listeners[req.Name]
 	mu.Unlock()
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"message":  "listener upserted",
-		"listener": created,
+		"listener": req,
 		"version":  currentVersion,
 	})
 }
@@ -459,6 +460,7 @@ func listenersListHandler(w http.ResponseWriter, r *http.Request) {
 	for _, l := range listeners {
 		items = append(items, l)
 	}
+	sort.Slice(items, func(i, j int) bool { return items[i].Name < items[j].Name })
 	currentVersion := atomic.LoadUint64(&version)
 	mu.Unlock()
 
@@ -479,6 +481,7 @@ func routeUpsertHandler(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, "invalid json body: "+err.Error())
 		return
 	}
+
 	if req.RouteName == "" {
 		badRequest(w, "route_name required")
 		return
@@ -491,37 +494,33 @@ func routeUpsertHandler(w http.ResponseWriter, r *http.Request) {
 		req.Domains = []string{"*"}
 	}
 
-	mu.Lock()
-	for i, rule := range req.Rules {
-		if rule.Prefix == "" {
-			mu.Unlock()
+	for i := range req.Rules {
+		if req.Rules[i].Prefix == "" {
 			badRequest(w, fmt.Sprintf("rules[%d].prefix required", i))
 			return
 		}
-		if rule.Cluster == "" {
-			mu.Unlock()
+		if req.Rules[i].Cluster == "" {
 			badRequest(w, fmt.Sprintf("rules[%d].cluster required", i))
 			return
 		}
+	}
+
+	mu.Lock()
+	for _, rule := range req.Rules {
 		if _, ok := backends[rule.Cluster]; !ok {
 			mu.Unlock()
-			badRequest(w, fmt.Sprintf("rules[%d].cluster %q not found", i, rule.Cluster))
+			badRequest(w, fmt.Sprintf("cluster %q not found", rule.Cluster))
 			return
 		}
 	}
 
-	old, hadOld := routesMap[req.RouteName]
-	routesMap[req.RouteName] = RouteSpec{
-		RouteName: req.RouteName,
-		Domains:   req.Domains,
-		Rules:     req.Rules,
-	}
-
+	prev, hadPrev := routeConfigs[req.RouteName]
+	routeConfigs[req.RouteName] = req
 	if err := rebuildSnapshotLocked(); err != nil {
-		if hadOld {
-			routesMap[req.RouteName] = old
+		if hadPrev {
+			routeConfigs[req.RouteName] = prev
 		} else {
-			delete(routesMap, req.RouteName)
+			delete(routeConfigs, req.RouteName)
 		}
 		mu.Unlock()
 		internalError(w, "failed to rebuild snapshot: "+err.Error())
@@ -529,12 +528,11 @@ func routeUpsertHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	currentVersion := atomic.LoadUint64(&version)
-	created := routesMap[req.RouteName]
 	mu.Unlock()
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"message": "route upserted",
-		"route":   created,
+		"message": "route config upserted",
+		"route":   req,
 		"version": currentVersion,
 	})
 }
@@ -545,23 +543,22 @@ func routeDeleteHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	routeName := r.URL.Query().Get("route_name")
-	if routeName == "" {
+	name := r.URL.Query().Get("route_name")
+	if name == "" {
 		badRequest(w, "route_name query parameter required")
 		return
 	}
 
 	mu.Lock()
-	rt, ok := routesMap[routeName]
+	rc, ok := routeConfigs[name]
 	if !ok {
 		mu.Unlock()
-		writeJSON(w, http.StatusNotFound, APIResponse{Message: "route not found"})
+		writeJSON(w, http.StatusNotFound, APIResponse{Message: "route config not found"})
 		return
 	}
-
-	delete(routesMap, routeName)
+	delete(routeConfigs, name)
 	if err := rebuildSnapshotLocked(); err != nil {
-		routesMap[routeName] = rt
+		routeConfigs[name] = rc
 		mu.Unlock()
 		internalError(w, "failed to rebuild snapshot: "+err.Error())
 		return
@@ -571,8 +568,8 @@ func routeDeleteHandler(w http.ResponseWriter, r *http.Request) {
 	mu.Unlock()
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"message": "route deleted",
-		"route":   rt,
+		"message": "route config deleted",
+		"route":   rc,
 		"version": currentVersion,
 	})
 }
@@ -584,10 +581,11 @@ func routesListHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	mu.Lock()
-	items := make([]RouteSpec, 0, len(routesMap))
-	for _, rt := range routesMap {
-		items = append(items, rt)
+	items := make([]RouteConfigSpec, 0, len(routeConfigs))
+	for _, rc := range routeConfigs {
+		items = append(items, rc)
 	}
+	sort.Slice(items, func(i, j int) bool { return items[i].RouteName < items[j].RouteName })
 	currentVersion := atomic.LoadUint64(&version)
 	mu.Unlock()
 
@@ -605,10 +603,10 @@ func stateHandler(w http.ResponseWriter, r *http.Request) {
 
 	mu.Lock()
 	resp := StateResponse{
-		Version:   atomic.LoadUint64(&version),
-		Backends:  make([]Backend, 0, len(backends)),
-		Listeners: make([]ListenerSpec, 0, len(listeners)),
-		Routes:    make([]RouteSpec, 0, len(routesMap)),
+		Version:      atomic.LoadUint64(&version),
+		Backends:     make([]Backend, 0, len(backends)),
+		Listeners:    make([]ListenerSpec, 0, len(listeners)),
+		RouteConfigs: make([]RouteConfigSpec, 0, len(routeConfigs)),
 	}
 	for _, b := range backends {
 		resp.Backends = append(resp.Backends, b)
@@ -616,12 +614,179 @@ func stateHandler(w http.ResponseWriter, r *http.Request) {
 	for _, l := range listeners {
 		resp.Listeners = append(resp.Listeners, l)
 	}
-	for _, rt := range routesMap {
-		resp.Routes = append(resp.Routes, rt)
+	for _, rc := range routeConfigs {
+		resp.RouteConfigs = append(resp.RouteConfigs, rc)
 	}
+	sort.Slice(resp.Backends, func(i, j int) bool { return resp.Backends[i].Service < resp.Backends[j].Service })
+	sort.Slice(resp.Listeners, func(i, j int) bool { return resp.Listeners[i].Name < resp.Listeners[j].Name })
+	sort.Slice(resp.RouteConfigs, func(i, j int) bool { return resp.RouteConfigs[i].RouteName < resp.RouteConfigs[j].RouteName })
 	mu.Unlock()
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func normalizeBackend(req BackendUpsertRequest) (Backend, error) {
+	service := strings.TrimSpace(req.Service)
+	if service == "" {
+		return Backend{}, fmt.Errorf("service required")
+	}
+
+	address := strings.TrimSpace(req.Address)
+	if address == "" {
+		address = strings.TrimSpace(req.IP)
+	}
+
+	backend := req
+	backend.Service = service
+	backend.Address = address
+	backend.IP = address
+
+	if len(backend.Endpoints) == 0 {
+		if address == "" {
+			return Backend{}, fmt.Errorf("address or ip required")
+		}
+		if backend.Port == 0 {
+			return Backend{}, fmt.Errorf("port required")
+		}
+	}
+
+	if backend.LBPolicy == "" {
+		backend.LBPolicy = "ROUND_ROBIN"
+	}
+
+	if backend.DiscoveryType == "" {
+		if len(backend.Endpoints) > 0 || net.ParseIP(address) != nil {
+			backend.DiscoveryType = "EDS"
+		} else {
+			backend.DiscoveryType = "LOGICAL_DNS"
+		}
+	}
+	backend.DiscoveryType = strings.ToUpper(strings.TrimSpace(backend.DiscoveryType))
+
+	switch backend.DiscoveryType {
+	case "EDS":
+		if len(backend.Endpoints) == 0 {
+			backend.Endpoints = []BackendEndpoint{{
+				Address:  address,
+				Port:     backend.Port,
+				Weight:   1,
+				Priority: 0,
+			}}
+		}
+	case "LOGICAL_DNS", "STRICT_DNS":
+		if address == "" {
+			if len(backend.Endpoints) == 0 {
+				return Backend{}, fmt.Errorf("address required for DNS cluster")
+			}
+			address = backend.Endpoints[0].Address
+			backend.Address = address
+			backend.IP = address
+			if backend.Port == 0 {
+				backend.Port = backend.Endpoints[0].Port
+			}
+		}
+		if backend.Port == 0 {
+			return Backend{}, fmt.Errorf("port required for DNS cluster")
+		}
+		if len(backend.Endpoints) > 0 {
+			// keep state but cluster will use the first host only for DNS types
+		}
+	default:
+		return Backend{}, fmt.Errorf("unsupported discovery_type %q", backend.DiscoveryType)
+	}
+
+	for i := range backend.Endpoints {
+		if backend.Endpoints[i].Address == "" {
+			return Backend{}, fmt.Errorf("endpoints[%d].address required", i)
+		}
+		if backend.Endpoints[i].Port == 0 {
+			return Backend{}, fmt.Errorf("endpoints[%d].port required", i)
+		}
+		if backend.Endpoints[i].Weight == 0 {
+			backend.Endpoints[i].Weight = 1
+		}
+	}
+
+	if backend.HealthCheck != nil {
+		normalizeHealthCheck(backend.HealthCheck)
+	}
+	if backend.OutlierDetection != nil {
+		normalizeOutlierDetection(backend.OutlierDetection)
+	}
+	for i := range backend.CircuitBreakers {
+		normalizeCircuitBreaker(&backend.CircuitBreakers[i])
+	}
+
+	return backend, nil
+}
+
+func normalizeHealthCheck(hc *HealthCheckSpec) {
+	if hc.Type == "" {
+		hc.Type = "http"
+	}
+	hc.Type = strings.ToLower(hc.Type)
+	if hc.TimeoutMS == 0 {
+		hc.TimeoutMS = 1000
+	}
+	if hc.IntervalMS == 0 {
+		hc.IntervalMS = 5000
+	}
+	if hc.HealthyThreshold == 0 {
+		hc.HealthyThreshold = 2
+	}
+	if hc.UnhealthyThreshold == 0 {
+		hc.UnhealthyThreshold = 2
+	}
+	if hc.Path == "" && hc.Type == "http" {
+		hc.Path = "/"
+	}
+}
+
+func normalizeOutlierDetection(od *OutlierDetectionSpec) {
+	if od.Consecutive5xx == 0 {
+		od.Consecutive5xx = 5
+	}
+	if od.IntervalMS == 0 {
+		od.IntervalMS = 10000
+	}
+	if od.BaseEjectionMS == 0 {
+		od.BaseEjectionMS = 30000
+	}
+	if od.MaxEjectionPct == 0 {
+		od.MaxEjectionPct = 50
+	}
+}
+
+func normalizeCircuitBreaker(cb *CircuitBreakersThresholdSpec) {
+	if cb.Priority == "" {
+		cb.Priority = "DEFAULT"
+	}
+	if cb.RetryBudgetPercent > 0 && cb.MinRetryConcurrency == 0 {
+		cb.MinRetryConcurrency = 3
+	}
+}
+
+func normalizeListenerTLS(tls *ListenerTLS) {
+	if tls.SecretName == "" {
+		tls.SecretName = "server_cert"
+	}
+	if tls.SDSPath == "" {
+		tls.SDSPath = "./sds.yaml"
+	}
+	if tls.WatchedDirectory == "" {
+		tls.WatchedDirectory = watchedDir(tls.SDSPath, ".")
+	}
+	if len(tls.ALPNProtocols) == 0 {
+		tls.ALPNProtocols = []string{"h2", "http/1.1"}
+	}
+	if tls.RequireClientCert {
+		if tls.ValidationSecretName == "" {
+			tls.ValidationSecretName = "validation_context"
+		}
+		if tls.ValidationSDSPath == "" {
+			tls.ValidationSDSPath = tls.SDSPath
+		}
+	}
 }
 
 func rebuildSnapshot() error {
@@ -633,26 +798,25 @@ func rebuildSnapshot() error {
 func rebuildSnapshotLocked() error {
 	clusterResources := make([]types.Resource, 0, len(backends))
 	endpointResources := make([]types.Resource, 0, len(backends))
-	routeResources := make([]types.Resource, 0, len(listeners)+len(routesMap))
+	routeResources := make([]types.Resource, 0, len(listeners))
 	listenerResources := make([]types.Resource, 0, len(listeners))
 
 	for _, b := range backends {
-		clusterResource, endpointResource, err := buildClusterAndEndpoint(b)
-		if err != nil {
-			return fmt.Errorf("build cluster %q: %w", b.Service, err)
-		}
-		clusterResources = append(clusterResources, clusterResource)
-		if endpointResource != nil {
-			endpointResources = append(endpointResources, endpointResource)
+		clusterResources = append(clusterResources, buildCluster(b))
+		if strings.EqualFold(b.DiscoveryType, "EDS") {
+			endpointResources = append(endpointResources, buildEndpointAssignment(b))
 		}
 	}
 
-	seenRoutes := map[string]bool{}
 	for _, l := range listeners {
-		if !seenRoutes[l.RouteName] {
-			routeResources = append(routeResources, buildRouteForListener(l))
-			seenRoutes[l.RouteName] = true
+		if _, ok := backends[l.Service]; !ok {
+			return fmt.Errorf("listener %q references missing cluster %q", l.Name, l.Service)
 		}
+		routeResource, err := buildRouteForListener(l)
+		if err != nil {
+			return err
+		}
+		routeResources = append(routeResources, routeResource)
 
 		listenerResource, err := buildListener(l)
 		if err != nil {
@@ -699,31 +863,27 @@ func rebuildSnapshotLocked() error {
 	return nil
 }
 
-func buildClusterAndEndpoint(b Backend) (*cluster.Cluster, *endpointv3.ClusterLoadAssignment, error) {
-	clusterResource := &cluster.Cluster{
-		Name:           b.Service,
+func buildCluster(spec Backend) *cluster.Cluster {
+	c := &cluster.Cluster{
+		Name:           spec.Service,
 		ConnectTimeout: durationpb.New(5 * time.Second),
-		LbPolicy:       cluster.Cluster_ROUND_ROBIN,
+		LbPolicy:       mapLBPolicy(spec.LBPolicy),
 	}
 
-	if b.UseHTTP2 {
-		clusterResource.Http2ProtocolOptions = &core.Http2ProtocolOptions{}
+	if spec.UseHTTP2 {
+		c.Http2ProtocolOptions = &core.Http2ProtocolOptions{}
 	}
 
-	if b.UpstreamTLS != nil && b.UpstreamTLS.Enabled {
-		transportSocket, err := buildUpstreamTLSTransportSocket(*b.UpstreamTLS)
-		if err != nil {
-			return nil, nil, err
-		}
-		clusterResource.TransportSocket = transportSocket
-	}
-
-	switch b.DiscoveryType {
-	case "EDS":
-		clusterResource.ClusterDiscoveryType = &cluster.Cluster_Type{
-			Type: cluster.Cluster_EDS,
-		}
-		clusterResource.EdsClusterConfig = &cluster.Cluster_EdsClusterConfig{
+	switch strings.ToUpper(spec.DiscoveryType) {
+	case "LOGICAL_DNS":
+		c.ClusterDiscoveryType = &cluster.Cluster_Type{Type: cluster.Cluster_LOGICAL_DNS}
+		c.LoadAssignment = buildDNSLoadAssignment(spec)
+	case "STRICT_DNS":
+		c.ClusterDiscoveryType = &cluster.Cluster_Type{Type: cluster.Cluster_STRICT_DNS}
+		c.LoadAssignment = buildDNSLoadAssignment(spec)
+	default:
+		c.ClusterDiscoveryType = &cluster.Cluster_Type{Type: cluster.Cluster_EDS}
+		c.EdsClusterConfig = &cluster.Cluster_EdsClusterConfig{
 			EdsConfig: &core.ConfigSource{
 				ResourceApiVersion: resource.DefaultAPIVersion,
 				ConfigSourceSpecifier: &core.ConfigSource_Ads{
@@ -731,75 +891,44 @@ func buildClusterAndEndpoint(b Backend) (*cluster.Cluster, *endpointv3.ClusterLo
 				},
 			},
 		}
-		return clusterResource, buildEndpoint(b.Service, b.Address, b.Port), nil
-
-	case "LOGICAL_DNS":
-		clusterResource.ClusterDiscoveryType = &cluster.Cluster_Type{
-			Type: cluster.Cluster_LOGICAL_DNS,
-		}
-		clusterResource.LoadAssignment = buildEndpoint(b.Service, b.Address, b.Port)
-		return clusterResource, nil, nil
-
-	default:
-		return nil, nil, fmt.Errorf("unsupported discovery_type %q", b.DiscoveryType)
-	}
-}
-
-func buildUpstreamTLSTransportSocket(cfg UpstreamTLS) (*core.TransportSocket, error) {
-	upstream := &tlsv3.UpstreamTlsContext{
-		CommonTlsContext: &tlsv3.CommonTlsContext{},
 	}
 
-	if cfg.SNI != "" {
-		upstream.Sni = cfg.SNI
-	}
-	upstream.AutoHostSni = cfg.AutoHostSNI
-	upstream.AutoSniSanValidation = cfg.AutoSNISANValidation
-
-	if cfg.TrustedCAFile != "" {
-		upstream.CommonTlsContext.ValidationContextType = &tlsv3.CommonTlsContext_ValidationContext{
-			ValidationContext: &tlsv3.CertificateValidationContext{
-				TrustedCa: &core.DataSource{
-					Specifier: &core.DataSource_Filename{
-						Filename: cfg.TrustedCAFile,
-					},
-				},
-			},
+	if spec.UpstreamTLS != nil && spec.UpstreamTLS.Enabled {
+		if transportSocket, err := buildUpstreamTLSTransportSocket(*spec.UpstreamTLS); err == nil {
+			c.TransportSocket = transportSocket
 		}
 	}
 
-	typedConfig, err := anypb.New(upstream)
-	if err != nil {
-		return nil, fmt.Errorf("pack upstream tls context: %w", err)
+	if spec.HealthCheck != nil {
+		c.HealthChecks = []*core.HealthCheck{buildHealthCheck(*spec.HealthCheck)}
+	}
+	if spec.OutlierDetection != nil {
+		c.OutlierDetection = buildOutlierDetection(*spec.OutlierDetection)
+	}
+	if len(spec.CircuitBreakers) > 0 {
+		c.CircuitBreakers = buildCircuitBreakers(spec.CircuitBreakers)
 	}
 
-	return &core.TransportSocket{
-		Name: "envoy.transport_sockets.tls",
-		ConfigType: &core.TransportSocket_TypedConfig{
-			TypedConfig: typedConfig,
-		},
-	}, nil
+	return c
 }
 
-func buildEndpoint(service, address string, port uint32) *endpointv3.ClusterLoadAssignment {
+func buildDNSLoadAssignment(spec Backend) *endpointv3.ClusterLoadAssignment {
+	address := spec.Address
+	port := spec.Port
+	if address == "" && len(spec.Endpoints) > 0 {
+		address = spec.Endpoints[0].Address
+		port = spec.Endpoints[0].Port
+	}
+
 	return &endpointv3.ClusterLoadAssignment{
-		ClusterName: service,
+		ClusterName: spec.Service,
 		Endpoints: []*endpointv3.LocalityLbEndpoints{
 			{
 				LbEndpoints: []*endpointv3.LbEndpoint{
 					{
 						HostIdentifier: &endpointv3.LbEndpoint_Endpoint{
 							Endpoint: &endpointv3.Endpoint{
-								Address: &core.Address{
-									Address: &core.Address_SocketAddress{
-										SocketAddress: &core.SocketAddress{
-											Address: address,
-											PortSpecifier: &core.SocketAddress_PortValue{
-												PortValue: port,
-											},
-										},
-									},
-								},
+								Address: socketAddress(address, port),
 							},
 						},
 					},
@@ -809,13 +938,123 @@ func buildEndpoint(service, address string, port uint32) *endpointv3.ClusterLoad
 	}
 }
 
-func buildRouteForListener(listener ListenerSpec) *routev3.RouteConfiguration {
-	if custom, ok := routesMap[listener.RouteName]; ok {
-		return buildRouteFromSpec(custom)
+func buildEndpointAssignment(spec Backend) *endpointv3.ClusterLoadAssignment {
+	byPriority := map[uint32][]*endpointv3.LbEndpoint{}
+	priorities := make([]int, 0)
+
+	seen := map[uint32]bool{}
+	for _, ep := range spec.Endpoints {
+		if !seen[ep.Priority] {
+			priorities = append(priorities, int(ep.Priority))
+			seen[ep.Priority] = true
+		}
+		lbEp := &endpointv3.LbEndpoint{
+			HostIdentifier: &endpointv3.LbEndpoint_Endpoint{
+				Endpoint: &endpointv3.Endpoint{
+					Address: socketAddress(ep.Address, ep.Port),
+				},
+			},
+		}
+		if ep.Weight > 0 {
+			lbEp.LoadBalancingWeight = &wrapperspb.UInt32Value{Value: ep.Weight}
+		}
+		byPriority[ep.Priority] = append(byPriority[ep.Priority], lbEp)
 	}
 
+	sort.Ints(priorities)
+
+	localities := make([]*endpointv3.LocalityLbEndpoints, 0, len(priorities))
+	for _, p := range priorities {
+		prio := uint32(p)
+		localities = append(localities, &endpointv3.LocalityLbEndpoints{
+			Priority:    prio,
+			LbEndpoints: byPriority[prio],
+		})
+	}
+
+	return &endpointv3.ClusterLoadAssignment{
+		ClusterName: spec.Service,
+		Endpoints:   localities,
+	}
+}
+
+func buildHealthCheck(spec HealthCheckSpec) *core.HealthCheck {
+	hc := &core.HealthCheck{
+		Timeout:            durationpb.New(time.Duration(spec.TimeoutMS) * time.Millisecond),
+		Interval:           durationpb.New(time.Duration(spec.IntervalMS) * time.Millisecond),
+		HealthyThreshold:   &wrapperspb.UInt32Value{Value: spec.HealthyThreshold},
+		UnhealthyThreshold: &wrapperspb.UInt32Value{Value: spec.UnhealthyThreshold},
+	}
+
+	switch spec.Type {
+	case "tcp":
+		hc.HealthChecker = &core.HealthCheck_TcpHealthCheck_{
+			TcpHealthCheck: &core.HealthCheck_TcpHealthCheck{},
+		}
+	default:
+		hc.HealthChecker = &core.HealthCheck_HttpHealthCheck_{
+			HttpHealthCheck: &core.HealthCheck_HttpHealthCheck{
+				Path: spec.Path,
+				Host: spec.Host,
+			},
+		}
+	}
+
+	return hc
+}
+
+func buildOutlierDetection(spec OutlierDetectionSpec) *cluster.OutlierDetection {
+	return &cluster.OutlierDetection{
+		Consecutive_5Xx:    &wrapperspb.UInt32Value{Value: spec.Consecutive5xx},
+		Interval:           durationpb.New(time.Duration(spec.IntervalMS) * time.Millisecond),
+		BaseEjectionTime:   durationpb.New(time.Duration(spec.BaseEjectionMS) * time.Millisecond),
+		MaxEjectionPercent: &wrapperspb.UInt32Value{Value: spec.MaxEjectionPct},
+	}
+}
+
+func buildCircuitBreakers(specs []CircuitBreakersThresholdSpec) *cluster.CircuitBreakers {
+	thresholds := make([]*cluster.CircuitBreakers_Thresholds, 0, len(specs))
+	for _, spec := range specs {
+		threshold := &cluster.CircuitBreakers_Thresholds{
+			Priority:       mapRoutingPriority(spec.Priority),
+			TrackRemaining: spec.TrackRemaining,
+		}
+		if spec.MaxConnections > 0 {
+			threshold.MaxConnections = &wrapperspb.UInt32Value{Value: spec.MaxConnections}
+		}
+		if spec.MaxPendingRequests > 0 {
+			threshold.MaxPendingRequests = &wrapperspb.UInt32Value{Value: spec.MaxPendingRequests}
+		}
+		if spec.MaxRequests > 0 {
+			threshold.MaxRequests = &wrapperspb.UInt32Value{Value: spec.MaxRequests}
+		}
+		if spec.MaxRetries > 0 {
+			threshold.MaxRetries = &wrapperspb.UInt32Value{Value: spec.MaxRetries}
+		}
+		if spec.MaxConnectionPools > 0 {
+			threshold.MaxConnectionPools = &wrapperspb.UInt32Value{Value: spec.MaxConnectionPools}
+		}
+		if spec.RetryBudgetPercent > 0 {
+			threshold.RetryBudget = &cluster.CircuitBreakers_Thresholds_RetryBudget{
+				BudgetPercent:       &typev3.Percent{Value: float64(spec.RetryBudgetPercent)},
+				MinRetryConcurrency: &wrapperspb.UInt32Value{Value: spec.MinRetryConcurrency},
+			}
+		}
+		thresholds = append(thresholds, threshold)
+	}
+	return &cluster.CircuitBreakers{Thresholds: thresholds}
+}
+
+func buildRouteForListener(listener ListenerSpec) (*routev3.RouteConfiguration, error) {
+	if cfg, ok := routeConfigs[listener.RouteName]; ok && len(cfg.Rules) > 0 {
+		return buildRouteFromSpec(cfg)
+	}
+	return buildDefaultRoute(listener.RouteName, listener.Service), nil
+}
+
+func buildDefaultRoute(routeName, service string) *routev3.RouteConfiguration {
 	return &routev3.RouteConfiguration{
-		Name: listener.RouteName,
+		Name: routeName,
 		VirtualHosts: []*routev3.VirtualHost{
 			{
 				Name:    "backend",
@@ -823,12 +1062,16 @@ func buildRouteForListener(listener ListenerSpec) *routev3.RouteConfiguration {
 				Routes: []*routev3.Route{
 					{
 						Match: &routev3.RouteMatch{
-							PathSpecifier: &routev3.RouteMatch_Prefix{Prefix: "/"},
+							PathSpecifier: &routev3.RouteMatch_Prefix{
+								Prefix: "/",
+							},
 						},
 						Action: &routev3.Route_Route{
 							Route: &routev3.RouteAction{
-								ClusterSpecifier: &routev3.RouteAction_Cluster{Cluster: listener.Service},
-								Timeout:          durationpb.New(0),
+								ClusterSpecifier: &routev3.RouteAction_Cluster{
+									Cluster: service,
+								},
+								Timeout: durationpb.New(0),
 							},
 						},
 					},
@@ -838,40 +1081,84 @@ func buildRouteForListener(listener ListenerSpec) *routev3.RouteConfiguration {
 	}
 }
 
-func buildRouteFromSpec(spec RouteSpec) *routev3.RouteConfiguration {
-	domains := spec.Domains
-	if len(domains) == 0 {
-		domains = []string{"*"}
+func buildRouteFromSpec(spec RouteConfigSpec) (*routev3.RouteConfiguration, error) {
+	vhost := &routev3.VirtualHost{
+		Name:    "backend",
+		Domains: spec.Domains,
+		Routes:  make([]*routev3.Route, 0, len(spec.Rules)),
+	}
+	if len(vhost.Domains) == 0 {
+		vhost.Domains = []string{"*"}
 	}
 
-	routes := make([]*routev3.Route, 0, len(spec.Rules))
 	for _, rule := range spec.Rules {
-		action := &routev3.RouteAction{
-			ClusterSpecifier: &routev3.RouteAction_Cluster{Cluster: rule.Cluster},
-			Timeout:          durationpb.New(0),
-		}
-		if rule.PrefixRewrite != "" {
-			action.PrefixRewrite = rule.PrefixRewrite
+		if _, ok := backends[rule.Cluster]; !ok {
+			return nil, fmt.Errorf("route %q references missing cluster %q", spec.RouteName, rule.Cluster)
 		}
 
-		routes = append(routes, &routev3.Route{
-			Match: &routev3.RouteMatch{
-				PathSpecifier: &routev3.RouteMatch_Prefix{Prefix: rule.Prefix},
+		routeAction := &routev3.RouteAction{
+			ClusterSpecifier: &routev3.RouteAction_Cluster{
+				Cluster: rule.Cluster,
 			},
-			Action: &routev3.Route_Route{Route: action},
+			Timeout: durationpb.New(time.Duration(rule.TimeoutMS) * time.Millisecond),
+		}
+		if rule.TimeoutMS == 0 {
+			routeAction.Timeout = durationpb.New(0)
+		}
+		if rule.PrefixRewrite != "" {
+			routeAction.PrefixRewrite = rule.PrefixRewrite
+		}
+		if rule.HostRewriteLiteral != "" {
+			routeAction.HostRewriteSpecifier = &routev3.RouteAction_HostRewriteLiteral{
+				HostRewriteLiteral: rule.HostRewriteLiteral,
+			}
+		}
+		if rule.RetryPolicy != nil {
+			routeAction.RetryPolicy = buildRetryPolicy(*rule.RetryPolicy)
+		}
+
+		vhost.Routes = append(vhost.Routes, &routev3.Route{
+			Match: &routev3.RouteMatch{
+				PathSpecifier: &routev3.RouteMatch_Prefix{
+					Prefix: rule.Prefix,
+				},
+			},
+			Action: &routev3.Route_Route{
+				Route: routeAction,
+			},
 		})
 	}
 
 	return &routev3.RouteConfiguration{
-		Name: spec.RouteName,
-		VirtualHosts: []*routev3.VirtualHost{
-			{
-				Name:    "backend",
-				Domains: domains,
-				Routes:  routes,
-			},
-		},
+		Name:         spec.RouteName,
+		VirtualHosts: []*routev3.VirtualHost{vhost},
+	}, nil
+}
+
+func buildRetryPolicy(spec RetryPolicySpec) *routev3.RetryPolicy {
+	retryOn := spec.RetryOn
+	if retryOn == "" {
+		retryOn = "5xx,connect-failure,refused-stream,reset"
 	}
+	numRetries := spec.NumRetries
+	if numRetries == 0 {
+		numRetries = 3
+	}
+
+	policy := &routev3.RetryPolicy{
+		RetryOn:    retryOn,
+		NumRetries: &wrapperspb.UInt32Value{Value: numRetries},
+	}
+	if spec.PerTryTimeoutMS > 0 {
+		policy.PerTryTimeout = durationpb.New(time.Duration(spec.PerTryTimeoutMS) * time.Millisecond)
+	}
+	if len(spec.RetriableStatusCodes) > 0 {
+		policy.RetriableStatusCodes = spec.RetriableStatusCodes
+	}
+	if spec.HostSelectionRetryMaxAttempts > 0 {
+		policy.HostSelectionRetryMaxAttempts = int64(spec.HostSelectionRetryMaxAttempts)
+	}
+	return policy
 }
 
 func buildListener(spec ListenerSpec) (*listenerv3.Listener, error) {
@@ -895,8 +1182,10 @@ func buildListener(spec ListenerSpec) (*listenerv3.Listener, error) {
 		},
 		HttpFilters: []*hcm.HttpFilter{
 			{
-				Name:       "envoy.filters.http.router",
-				ConfigType: &hcm.HttpFilter_TypedConfig{TypedConfig: routerConfig},
+				Name: "envoy.filters.http.router",
+				ConfigType: &hcm.HttpFilter_TypedConfig{
+					TypedConfig: routerConfig,
+				},
 			},
 		},
 	}
@@ -909,8 +1198,10 @@ func buildListener(spec ListenerSpec) (*listenerv3.Listener, error) {
 	filterChain := &listenerv3.FilterChain{
 		Filters: []*listenerv3.Filter{
 			{
-				Name:       "envoy.filters.network.http_connection_manager",
-				ConfigType: &listenerv3.Filter_TypedConfig{TypedConfig: typedConfig},
+				Name: "envoy.filters.network.http_connection_manager",
+				ConfigType: &listenerv3.Filter_TypedConfig{
+					TypedConfig: typedConfig,
+				},
 			},
 		},
 	}
@@ -924,15 +1215,8 @@ func buildListener(spec ListenerSpec) (*listenerv3.Listener, error) {
 	}
 
 	return &listenerv3.Listener{
-		Name: spec.Name,
-		Address: &core.Address{
-			Address: &core.Address_SocketAddress{
-				SocketAddress: &core.SocketAddress{
-					Address:       spec.Address,
-					PortSpecifier: &core.SocketAddress_PortValue{PortValue: spec.Port},
-				},
-			},
-		},
+		Name:         spec.Name,
+		Address:      socketAddress(spec.Address, spec.Port),
 		FilterChains: []*listenerv3.FilterChain{filterChain},
 	}, nil
 }
@@ -962,7 +1246,9 @@ func buildDownstreamTLSTransportSocket(cfg ListenerTLS) (*core.TransportSocket, 
 		}
 	}
 
-	downstream := &tlsv3.DownstreamTlsContext{CommonTlsContext: common}
+	downstream := &tlsv3.DownstreamTlsContext{
+		CommonTlsContext: common,
+	}
 	if cfg.RequireClientCert {
 		downstream.RequireClientCertificate = &wrapperspb.BoolValue{Value: true}
 	}
@@ -980,72 +1266,64 @@ func buildDownstreamTLSTransportSocket(cfg ListenerTLS) (*core.TransportSocket, 
 	}, nil
 }
 
+func buildUpstreamTLSTransportSocket(cfg UpstreamTLS) (*core.TransportSocket, error) {
+	common := &tlsv3.CommonTlsContext{}
+
+	if cfg.TrustedCAFile != "" {
+		common.ValidationContextType = &tlsv3.CommonTlsContext_ValidationContext{
+			ValidationContext: &tlsv3.CertificateValidationContext{
+				TrustedCa: &core.DataSource{
+					Specifier: &core.DataSource_Filename{
+						Filename: cfg.TrustedCAFile,
+					},
+				},
+			},
+		}
+	}
+	if cfg.ClientCertFile != "" && cfg.ClientKeyFile != "" {
+		common.TlsCertificates = []*tlsv3.TlsCertificate{
+			{
+				CertificateChain: &core.DataSource{
+					Specifier: &core.DataSource_Filename{Filename: cfg.ClientCertFile},
+				},
+				PrivateKey: &core.DataSource{
+					Specifier: &core.DataSource_Filename{Filename: cfg.ClientKeyFile},
+				},
+			},
+		}
+	}
+
+	upstream := &tlsv3.UpstreamTlsContext{
+		CommonTlsContext:     common,
+		Sni:                  cfg.SNI,
+		AutoHostSni:          cfg.AutoHostSNI,
+		AutoSniSanValidation: cfg.AutoSNISANValidation,
+	}
+
+	typedConfig, err := anypb.New(upstream)
+	if err != nil {
+		return nil, fmt.Errorf("pack upstream tls context: %w", err)
+	}
+
+	return &core.TransportSocket{
+		Name: "envoy.transport_sockets.tls",
+		ConfigType: &core.TransportSocket_TypedConfig{
+			TypedConfig: typedConfig,
+		},
+	}, nil
+}
+
 func buildPathConfigSource(path, watched string) *core.ConfigSource {
 	return &core.ConfigSource{
 		ResourceApiVersion: resource.DefaultAPIVersion,
 		ConfigSourceSpecifier: &core.ConfigSource_PathConfigSource{
 			PathConfigSource: &core.PathConfigSource{
-				Path:             path,
-				WatchedDirectory: &core.WatchedDirectory{Path: watched},
+				Path: path,
+				WatchedDirectory: &core.WatchedDirectory{
+					Path: watched,
+				},
 			},
 		},
-	}
-}
-
-func normalizeBackendRequest(req *BackendUpsertRequest) {
-	req.DiscoveryType = strings.ToUpper(strings.TrimSpace(req.DiscoveryType))
-	if req.DiscoveryType == "" {
-		if net.ParseIP(req.Address) != nil {
-			req.DiscoveryType = "EDS"
-		} else {
-			req.DiscoveryType = "LOGICAL_DNS"
-		}
-	}
-
-	if req.UpstreamTLS != nil && req.UpstreamTLS.Enabled {
-		if req.UpstreamTLS.SNI == "" && net.ParseIP(req.Address) == nil {
-			req.UpstreamTLS.SNI = req.Address
-		}
-		if net.ParseIP(req.Address) == nil {
-			req.UpstreamTLS.AutoHostSNI = true
-		}
-	}
-}
-
-func validateBackendRequest(req BackendUpsertRequest) error {
-	switch req.DiscoveryType {
-	case "EDS":
-		if net.ParseIP(req.Address) == nil {
-			return fmt.Errorf("EDS clusters require an IP address, got %q", req.Address)
-		}
-	case "LOGICAL_DNS":
-		// hostname or IP both work here
-	default:
-		return fmt.Errorf("discovery_type must be EDS or LOGICAL_DNS")
-	}
-	return nil
-}
-
-func normalizeListenerTLS(tls *ListenerTLS) {
-	if tls.SecretName == "" {
-		tls.SecretName = "server_cert"
-	}
-	if tls.SDSPath == "" {
-		tls.SDSPath = "./sds.yaml"
-	}
-	if tls.WatchedDirectory == "" {
-		tls.WatchedDirectory = watchedDir(tls.SDSPath, ".")
-	}
-	if len(tls.ALPNProtocols) == 0 {
-		tls.ALPNProtocols = []string{"h2", "http/1.1"}
-	}
-	if tls.RequireClientCert {
-		if tls.ValidationSecretName == "" {
-			tls.ValidationSecretName = "validation_context"
-		}
-		if tls.ValidationSDSPath == "" {
-			tls.ValidationSDSPath = tls.SDSPath
-		}
 	}
 }
 
@@ -1055,6 +1333,43 @@ func watchedDir(path, fallback string) string {
 		return fallback
 	}
 	return dir
+}
+
+func socketAddress(address string, port uint32) *core.Address {
+	return &core.Address{
+		Address: &core.Address_SocketAddress{
+			SocketAddress: &core.SocketAddress{
+				Address: address,
+				PortSpecifier: &core.SocketAddress_PortValue{
+					PortValue: port,
+				},
+			},
+		},
+	}
+}
+
+func mapRoutingPriority(priority string) core.RoutingPriority {
+	switch strings.ToUpper(strings.TrimSpace(priority)) {
+	case "HIGH":
+		return core.RoutingPriority_HIGH
+	default:
+		return core.RoutingPriority_DEFAULT
+	}
+}
+
+func mapLBPolicy(policy string) cluster.Cluster_LbPolicy {
+	switch strings.ToUpper(strings.TrimSpace(policy)) {
+	case "LEAST_REQUEST":
+		return cluster.Cluster_LEAST_REQUEST
+	case "RANDOM":
+		return cluster.Cluster_RANDOM
+	case "RING_HASH":
+		return cluster.Cluster_RING_HASH
+	case "MAGLEV":
+		return cluster.Cluster_MAGLEV
+	default:
+		return cluster.Cluster_ROUND_ROBIN
+	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
