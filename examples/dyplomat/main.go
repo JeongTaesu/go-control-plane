@@ -151,6 +151,7 @@ type RouteRule struct {
 	Cluster            string           `json:"cluster"`
 	PrefixRewrite      string           `json:"prefix_rewrite,omitempty"`
 	HostRewriteLiteral string           `json:"host_rewrite_literal,omitempty"`
+	AutoHostRewrite    bool             `json:"auto_host_rewrite,omitempty"`
 	TimeoutMS          uint32           `json:"timeout_ms,omitempty"`
 	RetryPolicy        *RetryPolicySpec `json:"retry_policy,omitempty"`
 }
@@ -648,54 +649,16 @@ func normalizeBackend(req BackendUpsertRequest) (Backend, error) {
 		if backend.Port == 0 {
 			return Backend{}, fmt.Errorf("port required")
 		}
-	}
-
-	if backend.LBPolicy == "" {
-		backend.LBPolicy = "ROUND_ROBIN"
-	}
-
-	if backend.DiscoveryType == "" {
-		if len(backend.Endpoints) > 0 || net.ParseIP(address) != nil {
-			backend.DiscoveryType = "EDS"
-		} else {
-			backend.DiscoveryType = "LOGICAL_DNS"
-		}
-	}
-	backend.DiscoveryType = strings.ToUpper(strings.TrimSpace(backend.DiscoveryType))
-
-	switch backend.DiscoveryType {
-	case "EDS":
-		if len(backend.Endpoints) == 0 {
-			backend.Endpoints = []BackendEndpoint{{
-				Address:  address,
-				Port:     backend.Port,
-				Weight:   1,
-				Priority: 0,
-			}}
-		}
-	case "LOGICAL_DNS", "STRICT_DNS":
-		if address == "" {
-			if len(backend.Endpoints) == 0 {
-				return Backend{}, fmt.Errorf("address required for DNS cluster")
-			}
-			address = backend.Endpoints[0].Address
-			backend.Address = address
-			backend.IP = address
-			if backend.Port == 0 {
-				backend.Port = backend.Endpoints[0].Port
-			}
-		}
-		if backend.Port == 0 {
-			return Backend{}, fmt.Errorf("port required for DNS cluster")
-		}
-		if len(backend.Endpoints) > 0 {
-			// keep state but cluster will use the first host only for DNS types
-		}
-	default:
-		return Backend{}, fmt.Errorf("unsupported discovery_type %q", backend.DiscoveryType)
+		backend.Endpoints = []BackendEndpoint{{
+			Address:  address,
+			Port:     backend.Port,
+			Weight:   1,
+			Priority: 0,
+		}}
 	}
 
 	for i := range backend.Endpoints {
+		backend.Endpoints[i].Address = strings.TrimSpace(backend.Endpoints[i].Address)
 		if backend.Endpoints[i].Address == "" {
 			return Backend{}, fmt.Errorf("endpoints[%d].address required", i)
 		}
@@ -705,6 +668,45 @@ func normalizeBackend(req BackendUpsertRequest) (Backend, error) {
 		if backend.Endpoints[i].Weight == 0 {
 			backend.Endpoints[i].Weight = 1
 		}
+	}
+
+	if backend.LBPolicy == "" {
+		backend.LBPolicy = "ROUND_ROBIN"
+	}
+
+	if backend.DiscoveryType == "" {
+		backend.DiscoveryType = inferDiscoveryType(backend)
+	}
+	backend.DiscoveryType = strings.ToUpper(strings.TrimSpace(backend.DiscoveryType))
+
+	switch backend.DiscoveryType {
+	case "EDS":
+		for i, ep := range backend.Endpoints {
+			if !isIPAddress(ep.Address) {
+				return Backend{}, fmt.Errorf("endpoints[%d].address=%q is a hostname. use STRICT_DNS or LOGICAL_DNS for hostname endpoints", i, ep.Address)
+			}
+		}
+	case "LOGICAL_DNS":
+		if len(backend.Endpoints) > 1 {
+			backend.DiscoveryType = "STRICT_DNS"
+		}
+		fallthrough
+	case "STRICT_DNS":
+		if backend.Address == "" && len(backend.Endpoints) > 0 {
+			backend.Address = backend.Endpoints[0].Address
+			backend.IP = backend.Address
+		}
+		if backend.Port == 0 && len(backend.Endpoints) > 0 {
+			backend.Port = backend.Endpoints[0].Port
+		}
+		if backend.Address == "" {
+			return Backend{}, fmt.Errorf("address required for DNS cluster")
+		}
+		if backend.Port == 0 {
+			return Backend{}, fmt.Errorf("port required for DNS cluster")
+		}
+	default:
+		return Backend{}, fmt.Errorf("unsupported discovery_type %q", backend.DiscoveryType)
 	}
 
 	if backend.HealthCheck != nil {
@@ -718,6 +720,24 @@ func normalizeBackend(req BackendUpsertRequest) (Backend, error) {
 	}
 
 	return backend, nil
+}
+
+func inferDiscoveryType(backend Backend) string {
+	if len(backend.Endpoints) == 0 {
+		if isIPAddress(backend.Address) {
+			return "EDS"
+		}
+		return "LOGICAL_DNS"
+	}
+	for _, ep := range backend.Endpoints {
+		if !isIPAddress(ep.Address) {
+			if len(backend.Endpoints) > 1 {
+				return "STRICT_DNS"
+			}
+			return "LOGICAL_DNS"
+		}
+	}
+	return "EDS"
 }
 
 func normalizeHealthCheck(hc *HealthCheckSpec) {
@@ -913,26 +933,21 @@ func buildCluster(spec Backend) *cluster.Cluster {
 }
 
 func buildDNSLoadAssignment(spec Backend) *endpointv3.ClusterLoadAssignment {
-	address := spec.Address
-	port := spec.Port
-	if address == "" && len(spec.Endpoints) > 0 {
-		address = spec.Endpoints[0].Address
-		port = spec.Endpoints[0].Port
+	lbEndpoints := make([]*endpointv3.LbEndpoint, 0, max(1, len(spec.Endpoints)))
+	if len(spec.Endpoints) > 0 {
+		for _, ep := range spec.Endpoints {
+			lbEndpoints = append(lbEndpoints, newLbEndpoint(ep.Address, ep.Port, ep.Weight))
+		}
+	} else {
+		weight := uint32(1)
+		lbEndpoints = append(lbEndpoints, newLbEndpoint(spec.Address, spec.Port, weight))
 	}
 
 	return &endpointv3.ClusterLoadAssignment{
 		ClusterName: spec.Service,
 		Endpoints: []*endpointv3.LocalityLbEndpoints{
 			{
-				LbEndpoints: []*endpointv3.LbEndpoint{
-					{
-						HostIdentifier: &endpointv3.LbEndpoint_Endpoint{
-							Endpoint: &endpointv3.Endpoint{
-								Address: socketAddress(address, port),
-							},
-						},
-					},
-				},
+				LbEndpoints: lbEndpoints,
 			},
 		},
 	}
@@ -948,17 +963,7 @@ func buildEndpointAssignment(spec Backend) *endpointv3.ClusterLoadAssignment {
 			priorities = append(priorities, int(ep.Priority))
 			seen[ep.Priority] = true
 		}
-		lbEp := &endpointv3.LbEndpoint{
-			HostIdentifier: &endpointv3.LbEndpoint_Endpoint{
-				Endpoint: &endpointv3.Endpoint{
-					Address: socketAddress(ep.Address, ep.Port),
-				},
-			},
-		}
-		if ep.Weight > 0 {
-			lbEp.LoadBalancingWeight = &wrapperspb.UInt32Value{Value: ep.Weight}
-		}
-		byPriority[ep.Priority] = append(byPriority[ep.Priority], lbEp)
+		byPriority[ep.Priority] = append(byPriority[ep.Priority], newLbEndpoint(ep.Address, ep.Port, ep.Weight))
 	}
 
 	sort.Ints(priorities)
@@ -976,6 +981,24 @@ func buildEndpointAssignment(spec Backend) *endpointv3.ClusterLoadAssignment {
 		ClusterName: spec.Service,
 		Endpoints:   localities,
 	}
+}
+
+func newLbEndpoint(address string, port, weight uint32) *endpointv3.LbEndpoint {
+	ep := &endpointv3.Endpoint{
+		Address: socketAddress(address, port),
+	}
+	if !isIPAddress(address) {
+		ep.Hostname = address
+	}
+	lbEp := &endpointv3.LbEndpoint{
+		HostIdentifier: &endpointv3.LbEndpoint_Endpoint{
+			Endpoint: ep,
+		},
+	}
+	if weight > 0 {
+		lbEp.LoadBalancingWeight = &wrapperspb.UInt32Value{Value: weight}
+	}
+	return lbEp
 }
 
 func buildHealthCheck(spec HealthCheckSpec) *core.HealthCheck {
@@ -1053,6 +1076,18 @@ func buildRouteForListener(listener ListenerSpec) (*routev3.RouteConfiguration, 
 }
 
 func buildDefaultRoute(routeName, service string) *routev3.RouteConfiguration {
+	routeAction := &routev3.RouteAction{
+		ClusterSpecifier: &routev3.RouteAction_Cluster{
+			Cluster: service,
+		},
+		Timeout: durationpb.New(0),
+	}
+	if backendUsesHostnameTargets(service) {
+		routeAction.HostRewriteSpecifier = &routev3.RouteAction_AutoHostRewrite{
+			AutoHostRewrite: true,
+		}
+	}
+
 	return &routev3.RouteConfiguration{
 		Name: routeName,
 		VirtualHosts: []*routev3.VirtualHost{
@@ -1067,12 +1102,7 @@ func buildDefaultRoute(routeName, service string) *routev3.RouteConfiguration {
 							},
 						},
 						Action: &routev3.Route_Route{
-							Route: &routev3.RouteAction{
-								ClusterSpecifier: &routev3.RouteAction_Cluster{
-									Cluster: service,
-								},
-								Timeout: durationpb.New(0),
-							},
+							Route: routeAction,
 						},
 					},
 				},
@@ -1111,6 +1141,10 @@ func buildRouteFromSpec(spec RouteConfigSpec) (*routev3.RouteConfiguration, erro
 		if rule.HostRewriteLiteral != "" {
 			routeAction.HostRewriteSpecifier = &routev3.RouteAction_HostRewriteLiteral{
 				HostRewriteLiteral: rule.HostRewriteLiteral,
+			}
+		} else if rule.AutoHostRewrite || backendUsesHostnameTargets(rule.Cluster) {
+			routeAction.HostRewriteSpecifier = &routev3.RouteAction_AutoHostRewrite{
+				AutoHostRewrite: true,
 			}
 		}
 		if rule.RetryPolicy != nil {
@@ -1346,6 +1380,33 @@ func socketAddress(address string, port uint32) *core.Address {
 			},
 		},
 	}
+}
+
+func backendUsesHostnameTargets(service string) bool {
+	spec, ok := backends[service]
+	if !ok {
+		return false
+	}
+	for _, ep := range spec.Endpoints {
+		if !isIPAddress(ep.Address) {
+			return true
+		}
+	}
+	if spec.Address != "" && !isIPAddress(spec.Address) {
+		return true
+	}
+	return false
+}
+
+func isIPAddress(s string) bool {
+	return net.ParseIP(strings.TrimSpace(s)) != nil
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func mapRoutingPriority(priority string) core.RoutingPriority {
