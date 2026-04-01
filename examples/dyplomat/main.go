@@ -35,7 +35,9 @@ import (
 	"github.com/envoyproxy/go-control-plane/pkg/resource/v3"
 	xds "github.com/envoyproxy/go-control-plane/pkg/server/v3"
 
+	localratelimit "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/local_ratelimit/v3"
 	"google.golang.org/grpc"
+
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
 	wrapperspb "google.golang.org/protobuf/types/known/wrapperspb"
@@ -111,6 +113,18 @@ type RetryPolicySpec struct {
 	HostSelectionRetryMaxAttempts uint32   `json:"host_selection_retry_max_attempts,omitempty"`
 }
 
+type LocalRateLimitSpec struct {
+	StatPrefix              string `json:"stat_prefix,omitempty"`
+	MaxTokens               uint32 `json:"max_tokens"`
+	TokensPerFill           uint32 `json:"tokens_per_fill,omitempty"`
+	FillIntervalMS          uint32 `json:"fill_interval_ms"`
+	EnabledPercent          uint32 `json:"enabled_percent,omitempty"`
+	EnforcedPercent         uint32 `json:"enforced_percent,omitempty"`
+	PerDownstreamConnection bool   `json:"per_downstream_connection,omitempty"`
+	ResponseHeaderKey       string `json:"response_header_key,omitempty"`
+	ResponseHeaderValue     string `json:"response_header_value,omitempty"`
+}
+
 type Backend struct {
 	Service          string                         `json:"service"`
 	Address          string                         `json:"address,omitempty"`
@@ -138,22 +152,25 @@ type ListenerTLS struct {
 }
 
 type ListenerSpec struct {
-	Name      string       `json:"name"`
-	Address   string       `json:"address"`
-	Port      uint32       `json:"port"`
-	RouteName string       `json:"route_name"`
-	Service   string       `json:"service"`
-	TLS       *ListenerTLS `json:"tls,omitempty"`
+	Name            string       `json:"name"`
+	Address         string       `json:"address"`
+	Port            uint32       `json:"port"`
+	RouteName       string       `json:"route_name"`
+	Service         string       `json:"service"`
+	TLS             *ListenerTLS `json:"tls,omitempty"`
+	EnableWebsocket bool         `json:"enable_websocket,omitempty"`
+	UpgradeTypes    []string     `json:"upgrade_types,omitempty"`
 }
 
 type RouteRule struct {
-	Prefix             string           `json:"prefix"`
-	Cluster            string           `json:"cluster"`
-	PrefixRewrite      string           `json:"prefix_rewrite,omitempty"`
-	HostRewriteLiteral string           `json:"host_rewrite_literal,omitempty"`
-	AutoHostRewrite    bool             `json:"auto_host_rewrite,omitempty"`
-	TimeoutMS          uint32           `json:"timeout_ms,omitempty"`
-	RetryPolicy        *RetryPolicySpec `json:"retry_policy,omitempty"`
+	Prefix             string              `json:"prefix"`
+	Cluster            string              `json:"cluster"`
+	PrefixRewrite      string              `json:"prefix_rewrite,omitempty"`
+	HostRewriteLiteral string              `json:"host_rewrite_literal,omitempty"`
+	AutoHostRewrite    bool                `json:"auto_host_rewrite,omitempty"`
+	TimeoutMS          uint32              `json:"timeout_ms,omitempty"`
+	RetryPolicy        *RetryPolicySpec    `json:"retry_policy,omitempty"`
+	LocalRateLimit     *LocalRateLimitSpec `json:"local_rate_limit,omitempty"`
 }
 
 type RouteConfigSpec struct {
@@ -381,6 +398,7 @@ func listenerUpsertHandler(w http.ResponseWriter, r *http.Request) {
 	if req.TLS != nil && req.TLS.Enabled {
 		normalizeListenerTLS(req.TLS)
 	}
+	normalizeListenerUpgrades(&req)
 
 	mu.Lock()
 	if _, ok := backends[req.Service]; !ok {
@@ -503,6 +521,9 @@ func routeUpsertHandler(w http.ResponseWriter, r *http.Request) {
 		if req.Rules[i].Cluster == "" {
 			badRequest(w, fmt.Sprintf("rules[%d].cluster required", i))
 			return
+		}
+		if req.Rules[i].LocalRateLimit != nil {
+			normalizeLocalRateLimit(req.Rules[i].LocalRateLimit, req.RouteName, i)
 		}
 	}
 
@@ -686,6 +707,12 @@ func normalizeBackend(req BackendUpsertRequest) (Backend, error) {
 				return Backend{}, fmt.Errorf("endpoints[%d].address=%q is a hostname. use STRICT_DNS or LOGICAL_DNS for hostname endpoints", i, ep.Address)
 			}
 		}
+	case "LOGICAL_DNS":
+		if len(backend.Endpoints) > 1 {
+			backend.DiscoveryType = "STRICT_DNS"
+		}
+		fallthrough
+	case "STRICT_DNS":
 		if backend.Address == "" && len(backend.Endpoints) > 0 {
 			backend.Address = backend.Endpoints[0].Address
 			backend.IP = backend.Address
@@ -693,27 +720,12 @@ func normalizeBackend(req BackendUpsertRequest) (Backend, error) {
 		if backend.Port == 0 && len(backend.Endpoints) > 0 {
 			backend.Port = backend.Endpoints[0].Port
 		}
-
-	case "LOGICAL_DNS":
-		if len(backend.Endpoints) > 1 {
-			backend.DiscoveryType = "STRICT_DNS"
+		if backend.Address == "" {
+			return Backend{}, fmt.Errorf("address required for DNS cluster")
 		}
-		fallthrough
-	case "STRICT_DNS":
-		// DNS 타입에서는 endpoints 전체를 실제 LB 대상으로 유지한다.
-		// top-level address/port는 endpoints가 없을 때만 보조 입력으로 사용한다.
-		if len(backend.Endpoints) == 0 {
-			if backend.Address == "" {
-				return Backend{}, fmt.Errorf("address required for DNS cluster")
-			}
-			if backend.Port == 0 {
-				return Backend{}, fmt.Errorf("port required for DNS cluster")
-			}
+		if backend.Port == 0 {
+			return Backend{}, fmt.Errorf("port required for DNS cluster")
 		}
-		backend.Address = ""
-		backend.IP = ""
-		backend.Port = 0
-
 	default:
 		return Backend{}, fmt.Errorf("unsupported discovery_type %q", backend.DiscoveryType)
 	}
@@ -815,6 +827,50 @@ func normalizeListenerTLS(tls *ListenerTLS) {
 		if tls.ValidationSDSPath == "" {
 			tls.ValidationSDSPath = tls.SDSPath
 		}
+	}
+}
+
+func normalizeListenerUpgrades(spec *ListenerSpec) {
+	seen := map[string]bool{}
+	upgrades := make([]string, 0, len(spec.UpgradeTypes)+1)
+	if spec.EnableWebsocket {
+		spec.UpgradeTypes = append(spec.UpgradeTypes, "websocket")
+	}
+	for _, upgrade := range spec.UpgradeTypes {
+		normalized := strings.ToLower(strings.TrimSpace(upgrade))
+		if normalized == "" || seen[normalized] {
+			continue
+		}
+		seen[normalized] = true
+		upgrades = append(upgrades, normalized)
+	}
+	spec.UpgradeTypes = upgrades
+}
+
+func normalizeLocalRateLimit(spec *LocalRateLimitSpec, routeName string, idx int) {
+	if spec.StatPrefix == "" {
+		spec.StatPrefix = fmt.Sprintf("%s_rule_%d_local_rate_limit", routeName, idx)
+	}
+	if spec.MaxTokens == 0 {
+		spec.MaxTokens = 1
+	}
+	if spec.TokensPerFill == 0 {
+		spec.TokensPerFill = spec.MaxTokens
+	}
+	if spec.FillIntervalMS == 0 {
+		spec.FillIntervalMS = 1000
+	}
+	if spec.EnabledPercent == 0 {
+		spec.EnabledPercent = 100
+	}
+	if spec.EnforcedPercent == 0 {
+		spec.EnforcedPercent = 100
+	}
+	if spec.ResponseHeaderKey == "" {
+		spec.ResponseHeaderKey = "x-local-rate-limit"
+	}
+	if spec.ResponseHeaderValue == "" {
+		spec.ResponseHeaderValue = "true"
 	}
 }
 
@@ -1160,7 +1216,7 @@ func buildRouteFromSpec(spec RouteConfigSpec) (*routev3.RouteConfiguration, erro
 			routeAction.RetryPolicy = buildRetryPolicy(*rule.RetryPolicy)
 		}
 
-		vhost.Routes = append(vhost.Routes, &routev3.Route{
+		routeEntry := &routev3.Route{
 			Match: &routev3.RouteMatch{
 				PathSpecifier: &routev3.RouteMatch_Prefix{
 					Prefix: rule.Prefix,
@@ -1169,7 +1225,18 @@ func buildRouteFromSpec(spec RouteConfigSpec) (*routev3.RouteConfiguration, erro
 			Action: &routev3.Route_Route{
 				Route: routeAction,
 			},
-		})
+		}
+		if rule.LocalRateLimit != nil {
+			cfgAny, err := anypb.New(buildRouteLocalRateLimit(*rule.LocalRateLimit))
+			if err != nil {
+				return nil, fmt.Errorf("pack local rate limit config for route %q: %w", spec.RouteName, err)
+			}
+			routeEntry.TypedPerFilterConfig = map[string]*anypb.Any{
+				"envoy.filters.http.local_ratelimit": cfgAny,
+			}
+		}
+
+		vhost.Routes = append(vhost.Routes, routeEntry)
 	}
 
 	return &routev3.RouteConfiguration{
@@ -1204,6 +1271,54 @@ func buildRetryPolicy(spec RetryPolicySpec) *routev3.RetryPolicy {
 	return policy
 }
 
+func routeConfigUsesLocalRateLimit(routeName string) bool {
+	cfg, ok := routeConfigs[routeName]
+	if !ok {
+		return false
+	}
+	for _, rule := range cfg.Rules {
+		if rule.LocalRateLimit != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func buildRouteLocalRateLimit(spec LocalRateLimitSpec) *localratelimit.LocalRateLimit {
+	cfg := &localratelimit.LocalRateLimit{
+		StatPrefix: spec.StatPrefix,
+		TokenBucket: &typev3.TokenBucket{
+			MaxTokens:     spec.MaxTokens,
+			TokensPerFill: &wrapperspb.UInt32Value{Value: spec.TokensPerFill},
+			FillInterval:  durationpb.New(time.Duration(spec.FillIntervalMS) * time.Millisecond),
+		},
+		FilterEnabled:                         buildRuntimeFractionalPercent(spec.EnabledPercent),
+		FilterEnforced:                        buildRuntimeFractionalPercent(spec.EnforcedPercent),
+		LocalRateLimitPerDownstreamConnection: spec.PerDownstreamConnection,
+	}
+	if spec.ResponseHeaderKey != "" {
+		cfg.ResponseHeadersToAdd = []*core.HeaderValueOption{
+			{
+				Header:       &core.HeaderValue{Key: spec.ResponseHeaderKey, Value: spec.ResponseHeaderValue},
+				AppendAction: core.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+			},
+		}
+	}
+	return cfg
+}
+
+func buildRuntimeFractionalPercent(pct uint32) *core.RuntimeFractionalPercent {
+	if pct > 100 {
+		pct = 100
+	}
+	return &core.RuntimeFractionalPercent{
+		DefaultValue: &typev3.FractionalPercent{
+			Numerator:   pct,
+			Denominator: typev3.FractionalPercent_HUNDRED,
+		},
+	}
+}
+
 func buildListener(spec ListenerSpec) (*listenerv3.Listener, error) {
 	routerConfig, err := anypb.New(&router.Router{})
 	if err != nil {
@@ -1223,14 +1338,38 @@ func buildListener(spec ListenerSpec) (*listenerv3.Listener, error) {
 				},
 			},
 		},
-		HttpFilters: []*hcm.HttpFilter{
-			{
-				Name: "envoy.filters.http.router",
-				ConfigType: &hcm.HttpFilter_TypedConfig{
-					TypedConfig: routerConfig,
-				},
+		HttpFilters: []*hcm.HttpFilter{},
+	}
+
+	if routeConfigUsesLocalRateLimit(spec.RouteName) {
+		localRateLimitCfg, err := anypb.New(&localratelimit.LocalRateLimit{
+			StatPrefix: spec.Name + "_http_local_rate_limiter",
+		})
+		if err != nil {
+			return nil, fmt.Errorf("pack local rate limit filter: %w", err)
+		}
+		manager.HttpFilters = append(manager.HttpFilters, &hcm.HttpFilter{
+			Name: "envoy.filters.http.local_ratelimit",
+			ConfigType: &hcm.HttpFilter_TypedConfig{
+				TypedConfig: localRateLimitCfg,
 			},
+		})
+	}
+
+	manager.HttpFilters = append(manager.HttpFilters, &hcm.HttpFilter{
+		Name: "envoy.filters.http.router",
+		ConfigType: &hcm.HttpFilter_TypedConfig{
+			TypedConfig: routerConfig,
 		},
+	})
+
+	if len(spec.UpgradeTypes) > 0 {
+		manager.UpgradeConfigs = make([]*hcm.HttpConnectionManager_UpgradeConfig, 0, len(spec.UpgradeTypes))
+		for _, upgradeType := range spec.UpgradeTypes {
+			manager.UpgradeConfigs = append(manager.UpgradeConfigs, &hcm.HttpConnectionManager_UpgradeConfig{
+				UpgradeType: upgradeType,
+			})
+		}
 	}
 
 	typedConfig, err := anypb.New(manager)
