@@ -686,12 +686,6 @@ func normalizeBackend(req BackendUpsertRequest) (Backend, error) {
 				return Backend{}, fmt.Errorf("endpoints[%d].address=%q is a hostname. use STRICT_DNS or LOGICAL_DNS for hostname endpoints", i, ep.Address)
 			}
 		}
-	case "LOGICAL_DNS":
-		if len(backend.Endpoints) > 1 {
-			backend.DiscoveryType = "STRICT_DNS"
-		}
-		fallthrough
-	case "STRICT_DNS":
 		if backend.Address == "" && len(backend.Endpoints) > 0 {
 			backend.Address = backend.Endpoints[0].Address
 			backend.IP = backend.Address
@@ -699,12 +693,27 @@ func normalizeBackend(req BackendUpsertRequest) (Backend, error) {
 		if backend.Port == 0 && len(backend.Endpoints) > 0 {
 			backend.Port = backend.Endpoints[0].Port
 		}
-		if backend.Address == "" {
-			return Backend{}, fmt.Errorf("address required for DNS cluster")
+
+	case "LOGICAL_DNS":
+		if len(backend.Endpoints) > 1 {
+			backend.DiscoveryType = "STRICT_DNS"
 		}
-		if backend.Port == 0 {
-			return Backend{}, fmt.Errorf("port required for DNS cluster")
+		fallthrough
+	case "STRICT_DNS":
+		// DNS 타입에서는 endpoints 전체를 실제 LB 대상으로 유지한다.
+		// top-level address/port는 endpoints가 없을 때만 보조 입력으로 사용한다.
+		if len(backend.Endpoints) == 0 {
+			if backend.Address == "" {
+				return Backend{}, fmt.Errorf("address required for DNS cluster")
+			}
+			if backend.Port == 0 {
+				return Backend{}, fmt.Errorf("port required for DNS cluster")
+			}
 		}
+		backend.Address = ""
+		backend.IP = ""
+		backend.Port = 0
+
 	default:
 		return Backend{}, fmt.Errorf("unsupported discovery_type %q", backend.DiscoveryType)
 	}
@@ -1084,7 +1093,7 @@ func buildDefaultRoute(routeName, service string) *routev3.RouteConfiguration {
 	}
 	if backendUsesHostnameTargets(service) {
 		routeAction.HostRewriteSpecifier = &routev3.RouteAction_AutoHostRewrite{
-			AutoHostRewrite: true,
+			AutoHostRewrite: wrapperspb.Bool(true),
 		}
 	}
 
@@ -1144,7 +1153,7 @@ func buildRouteFromSpec(spec RouteConfigSpec) (*routev3.RouteConfiguration, erro
 			}
 		} else if rule.AutoHostRewrite || backendUsesHostnameTargets(rule.Cluster) {
 			routeAction.HostRewriteSpecifier = &routev3.RouteAction_AutoHostRewrite{
-				AutoHostRewrite: true,
+				AutoHostRewrite: wrapperspb.Bool(true),
 			}
 		}
 		if rule.RetryPolicy != nil {
