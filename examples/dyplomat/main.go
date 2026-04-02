@@ -21,6 +21,7 @@ import (
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	router "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
 	hcm "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
+	tcpproxy "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/tcp_proxy/v3"
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 
@@ -155,7 +156,8 @@ type ListenerSpec struct {
 	Name            string       `json:"name"`
 	Address         string       `json:"address"`
 	Port            uint32       `json:"port"`
-	RouteName       string       `json:"route_name"`
+	Protocol        string       `json:"protocol,omitempty"`
+	RouteName       string       `json:"route_name,omitempty"`
 	Service         string       `json:"service"`
 	TLS             *ListenerTLS `json:"tls,omitempty"`
 	EnableWebsocket bool         `json:"enable_websocket,omitempty"`
@@ -388,7 +390,8 @@ func listenerUpsertHandler(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, "port required")
 		return
 	}
-	if req.RouteName == "" {
+	normalizeListenerProtocol(&req)
+	if req.Protocol == "http" && req.RouteName == "" {
 		req.RouteName = "route_" + req.Name
 	}
 	if req.Service == "" {
@@ -398,7 +401,13 @@ func listenerUpsertHandler(w http.ResponseWriter, r *http.Request) {
 	if req.TLS != nil && req.TLS.Enabled {
 		normalizeListenerTLS(req.TLS)
 	}
-	normalizeListenerUpgrades(&req)
+	if req.Protocol == "http" {
+		normalizeListenerUpgrades(&req)
+	} else {
+		req.RouteName = ""
+		req.EnableWebsocket = false
+		req.UpgradeTypes = nil
+	}
 
 	mu.Lock()
 	if _, ok := backends[req.Service]; !ok {
@@ -807,6 +816,13 @@ func normalizeCircuitBreaker(cb *CircuitBreakersThresholdSpec) {
 	}
 }
 
+func normalizeListenerProtocol(spec *ListenerSpec) {
+	if spec.Protocol == "" {
+		spec.Protocol = "http"
+	}
+	spec.Protocol = strings.ToLower(strings.TrimSpace(spec.Protocol))
+}
+
 func normalizeListenerTLS(tls *ListenerTLS) {
 	if tls.SecretName == "" {
 		tls.SecretName = "server_cert"
@@ -897,11 +913,15 @@ func rebuildSnapshotLocked() error {
 		if _, ok := backends[l.Service]; !ok {
 			return fmt.Errorf("listener %q references missing cluster %q", l.Name, l.Service)
 		}
-		routeResource, err := buildRouteForListener(l)
-		if err != nil {
-			return err
+		normalizeListenerProtocol(&l)
+
+		if listenerUsesHTTP(l) {
+			routeResource, err := buildRouteForListener(l)
+			if err != nil {
+				return err
+			}
+			routeResources = append(routeResources, routeResource)
 		}
-		routeResources = append(routeResources, routeResource)
 
 		listenerResource, err := buildListener(l)
 		if err != nil {
@@ -1134,10 +1154,21 @@ func buildCircuitBreakers(specs []CircuitBreakersThresholdSpec) *cluster.Circuit
 }
 
 func buildRouteForListener(listener ListenerSpec) (*routev3.RouteConfiguration, error) {
+	if !listenerUsesHTTP(listener) {
+		return nil, fmt.Errorf("listener %q uses protocol %q and does not support HTTP route configs", listener.Name, listener.Protocol)
+	}
 	if cfg, ok := routeConfigs[listener.RouteName]; ok && len(cfg.Rules) > 0 {
 		return buildRouteFromSpec(cfg)
 	}
 	return buildDefaultRoute(listener.RouteName, listener.Service), nil
+}
+
+func listenerUsesHTTP(listener ListenerSpec) bool {
+	return strings.EqualFold(strings.TrimSpace(listener.Protocol), "") ||
+		strings.EqualFold(listener.Protocol, "http") ||
+		strings.EqualFold(listener.Protocol, "http1") ||
+		strings.EqualFold(listener.Protocol, "http2") ||
+		strings.EqualFold(listener.Protocol, "https")
 }
 
 func buildDefaultRoute(routeName, service string) *routev3.RouteConfiguration {
@@ -1320,6 +1351,39 @@ func buildRuntimeFractionalPercent(pct uint32) *core.RuntimeFractionalPercent {
 }
 
 func buildListener(spec ListenerSpec) (*listenerv3.Listener, error) {
+	normalizeListenerProtocol(&spec)
+
+	filterChain, err := buildFilterChain(spec)
+	if err != nil {
+		return nil, err
+	}
+
+	if spec.TLS != nil && spec.TLS.Enabled {
+		transportSocket, err := buildDownstreamTLSTransportSocket(*spec.TLS)
+		if err != nil {
+			return nil, err
+		}
+		filterChain.TransportSocket = transportSocket
+	}
+
+	return &listenerv3.Listener{
+		Name:         spec.Name,
+		Address:      socketAddress(spec.Address, spec.Port),
+		FilterChains: []*listenerv3.FilterChain{filterChain},
+	}, nil
+}
+
+func buildFilterChain(spec ListenerSpec) (*listenerv3.FilterChain, error) {
+	if listenerUsesHTTP(spec) {
+		return buildHTTPFilterChain(spec)
+	}
+	if strings.EqualFold(spec.Protocol, "tcp") {
+		return buildTCPFilterChain(spec)
+	}
+	return nil, fmt.Errorf("unsupported listener protocol %q", spec.Protocol)
+}
+
+func buildHTTPFilterChain(spec ListenerSpec) (*listenerv3.FilterChain, error) {
 	routerConfig, err := anypb.New(&router.Router{})
 	if err != nil {
 		return nil, fmt.Errorf("pack router filter: %w", err)
@@ -1377,7 +1441,7 @@ func buildListener(spec ListenerSpec) (*listenerv3.Listener, error) {
 		return nil, fmt.Errorf("pack http connection manager: %w", err)
 	}
 
-	filterChain := &listenerv3.FilterChain{
+	return &listenerv3.FilterChain{
 		Filters: []*listenerv3.Filter{
 			{
 				Name: "envoy.filters.network.http_connection_manager",
@@ -1386,20 +1450,29 @@ func buildListener(spec ListenerSpec) (*listenerv3.Listener, error) {
 				},
 			},
 		},
+	}, nil
+}
+
+func buildTCPFilterChain(spec ListenerSpec) (*listenerv3.FilterChain, error) {
+	tcpProxyConfig, err := anypb.New(&tcpproxy.TcpProxy{
+		StatPrefix: spec.Name,
+		ClusterSpecifier: &tcpproxy.TcpProxy_Cluster{
+			Cluster: spec.Service,
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("pack tcp proxy filter: %w", err)
 	}
 
-	if spec.TLS != nil && spec.TLS.Enabled {
-		transportSocket, err := buildDownstreamTLSTransportSocket(*spec.TLS)
-		if err != nil {
-			return nil, err
-		}
-		filterChain.TransportSocket = transportSocket
-	}
-
-	return &listenerv3.Listener{
-		Name:         spec.Name,
-		Address:      socketAddress(spec.Address, spec.Port),
-		FilterChains: []*listenerv3.FilterChain{filterChain},
+	return &listenerv3.FilterChain{
+		Filters: []*listenerv3.Filter{
+			{
+				Name: "envoy.filters.network.tcp_proxy",
+				ConfigType: &listenerv3.Filter_TypedConfig{
+					TypedConfig: tcpProxyConfig,
+				},
+			},
+		},
 	}, nil
 }
 
