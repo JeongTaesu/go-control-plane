@@ -197,6 +197,14 @@ type StateResponse struct {
 	RouteConfigs []RouteConfigSpec `json:"route_configs"`
 }
 
+type ResetStateResponse struct {
+	Message             string `json:"message"`
+	Version             uint64 `json:"version"`
+	ClearedBackends     int    `json:"cleared_backends"`
+	ClearedListeners    int    `json:"cleared_listeners"`
+	ClearedRouteConfigs int    `json:"cleared_route_configs"`
+}
+
 func main() {
 	snapshotCache = cache.NewSnapshotCache(false, cache.IDHash{}, nil)
 	server := xds.NewServer(context.Background(), snapshotCache, nil)
@@ -241,6 +249,7 @@ func startHTTPServer() {
 	mux.HandleFunc("/routes", routesListHandler)
 
 	mux.HandleFunc("/state", stateHandler)
+	mux.HandleFunc("/state/reset", stateResetHandler)
 
 	log.Printf("REST API listening on %s", apiListenAddr)
 	if err := http.ListenAndServe(apiListenAddr, mux); err != nil {
@@ -654,6 +663,48 @@ func stateHandler(w http.ResponseWriter, r *http.Request) {
 	mu.Unlock()
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func stateResetHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodDelete {
+		methodNotAllowed(w)
+		return
+	}
+
+	mu.Lock()
+
+	clearedBackends := len(backends)
+	clearedListeners := len(listeners)
+	clearedRouteConfigs := len(routeConfigs)
+
+	prevBackends := backends
+	prevListeners := listeners
+	prevRouteConfigs := routeConfigs
+
+	backends = map[string]Backend{}
+	listeners = map[string]ListenerSpec{}
+	routeConfigs = map[string]RouteConfigSpec{}
+
+	if err := rebuildSnapshotLocked(); err != nil {
+		backends = prevBackends
+		listeners = prevListeners
+		routeConfigs = prevRouteConfigs
+		mu.Unlock()
+
+		internalError(w, "failed to reset state: "+err.Error())
+		return
+	}
+
+	currentVersion := atomic.LoadUint64(&version)
+	mu.Unlock()
+
+	writeJSON(w, http.StatusOK, ResetStateResponse{
+		Message:             "state reset completed",
+		Version:             currentVersion,
+		ClearedBackends:     clearedBackends,
+		ClearedListeners:    clearedListeners,
+		ClearedRouteConfigs: clearedRouteConfigs,
+	})
 }
 
 func normalizeBackend(req BackendUpsertRequest) (Backend, error) {
