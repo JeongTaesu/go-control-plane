@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/url"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -47,13 +50,15 @@ import (
 const (
 	nodeID        = "local-envoy"
 	xdsListenAddr = ":18000"
-	apiListenAddr = ":8081"
+	apiListenAddr = ":8082"
 )
 
 var (
 	snapshotCache cache.SnapshotCache
 	version       uint64
 	mu            sync.Mutex
+
+	unoProxyAdminURL = getenv("UNO_PROXY_ADMIN_URL", "http://127.0.0.1:9901")
 
 	backends     = map[string]Backend{}
 	listeners    = map[string]ListenerSpec{}
@@ -250,6 +255,7 @@ func startHTTPServer() {
 
 	mux.HandleFunc("/state", stateHandler)
 	mux.HandleFunc("/state/reset", stateResetHandler)
+	mux.HandleFunc("/config_dump", configDumpHandler)
 
 	log.Printf("REST API listening on %s", apiListenAddr)
 	if err := http.ListenAndServe(apiListenAddr, mux); err != nil {
@@ -705,6 +711,79 @@ func stateResetHandler(w http.ResponseWriter, r *http.Request) {
 		ClearedListeners:    clearedListeners,
 		ClearedRouteConfigs: clearedRouteConfigs,
 	})
+}
+
+func configDumpHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+
+	targetURL, err := buildUnoProxyAdminURL("/config_dump", r.URL.Query())
+	if err != nil {
+		internalError(w, "failed to build config_dump url: "+err.Error())
+		return
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, targetURL, nil)
+	if err != nil {
+		internalError(w, "failed to create config_dump request: "+err.Error())
+		return
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		internalError(w, "failed to call UNO Proxy admin config_dump: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		internalError(w, "failed to read config_dump response: "+err.Error())
+		return
+	}
+
+	contentType := resp.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = "application/json"
+	}
+
+	w.Header().Set("Content-Type", contentType)
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write(body)
+}
+
+func buildUnoProxyAdminURL(path string, query url.Values) (string, error) {
+	baseURL := strings.TrimRight(unoProxyAdminURL, "/")
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+
+	parsedURL, err := url.Parse(baseURL + path)
+	if err != nil {
+		return "", err
+	}
+
+	q := parsedURL.Query()
+	for key, values := range query {
+		for _, value := range values {
+			q.Add(key, value)
+		}
+	}
+	parsedURL.RawQuery = q.Encode()
+
+	return parsedURL.String(), nil
+}
+
+func getenv(key, defaultValue string) string {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return defaultValue
+	}
+	return value
 }
 
 func normalizeBackend(req BackendUpsertRequest) (Backend, error) {
