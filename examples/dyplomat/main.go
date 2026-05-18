@@ -41,6 +41,7 @@ import (
 
 	localratelimit "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/local_ratelimit/v3"
 	"google.golang.org/grpc"
+	yaml "gopkg.in/yaml.v3"
 
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
@@ -256,6 +257,7 @@ func startHTTPServer() {
 	mux.HandleFunc("/state", stateHandler)
 	mux.HandleFunc("/state/reset", stateResetHandler)
 	mux.HandleFunc("/config_dump", configDumpHandler)
+	mux.HandleFunc("/export/static-yaml", staticYamlExportHandler)
 
 	log.Printf("REST API listening on %s", apiListenAddr)
 	if err := http.ListenAndServe(apiListenAddr, mux); err != nil {
@@ -754,6 +756,560 @@ func configDumpHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", contentType)
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(body)
+}
+
+func staticYamlExportHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+
+	data, err := buildStaticBootstrapYAML()
+	if err != nil {
+		internalError(w, "failed to export static yaml: "+err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/x-yaml; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="uno-proxy-static.yaml"`)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+}
+
+func buildStaticBootstrapYAML() ([]byte, error) {
+	mu.Lock()
+	defer mu.Unlock()
+
+	clusterKeys := make([]string, 0, len(backends))
+	for key := range backends {
+		clusterKeys = append(clusterKeys, key)
+	}
+	sort.Strings(clusterKeys)
+
+	listenerKeys := make([]string, 0, len(listeners))
+	for key := range listeners {
+		listenerKeys = append(listenerKeys, key)
+	}
+	sort.Strings(listenerKeys)
+
+	clusters := make([]any, 0, len(clusterKeys))
+	for _, key := range clusterKeys {
+		clusters = append(clusters, buildStaticClusterYAML(backends[key]))
+	}
+
+	listenerItems := make([]any, 0, len(listenerKeys))
+	for _, key := range listenerKeys {
+		listener, err := buildStaticListenerYAML(listeners[key])
+		if err != nil {
+			return nil, err
+		}
+		listenerItems = append(listenerItems, listener)
+	}
+
+	bootstrap := map[string]any{
+		"admin": map[string]any{
+			"address": map[string]any{
+				"socket_address": map[string]any{
+					"address":    "0.0.0.0",
+					"port_value": 9901,
+				},
+			},
+		},
+		"static_resources": map[string]any{
+			"listeners": listenerItems,
+			"clusters":  clusters,
+		},
+	}
+
+	return yaml.Marshal(bootstrap)
+}
+
+func buildStaticClusterYAML(spec Backend) map[string]any {
+	clusterType := strings.ToUpper(strings.TrimSpace(spec.DiscoveryType))
+	if clusterType == "" || clusterType == "EDS" {
+		clusterType = "STATIC"
+	}
+
+	c := map[string]any{
+		"name":            spec.Service,
+		"connect_timeout": "5s",
+		"type":            clusterType,
+		"lb_policy":       defaultString(spec.LBPolicy, "ROUND_ROBIN"),
+		"load_assignment": buildStaticLoadAssignmentYAML(spec),
+	}
+
+	if spec.UseHTTP2 {
+		c["http2_protocol_options"] = map[string]any{}
+	}
+	if spec.UpstreamTLS != nil && spec.UpstreamTLS.Enabled {
+		c["transport_socket"] = buildStaticUpstreamTransportSocketYAML(*spec.UpstreamTLS)
+	}
+	if spec.HealthCheck != nil {
+		normalizeHealthCheck(spec.HealthCheck)
+		c["health_checks"] = []any{buildStaticHealthCheckYAML(*spec.HealthCheck)}
+	}
+	if spec.OutlierDetection != nil {
+		normalizeOutlierDetection(spec.OutlierDetection)
+		c["outlier_detection"] = buildStaticOutlierDetectionYAML(*spec.OutlierDetection)
+	}
+	if len(spec.CircuitBreakers) > 0 {
+		for i := range spec.CircuitBreakers {
+			normalizeCircuitBreaker(&spec.CircuitBreakers[i])
+		}
+		c["circuit_breakers"] = buildStaticCircuitBreakersYAML(spec.CircuitBreakers)
+	}
+
+	return c
+}
+
+func buildStaticLoadAssignmentYAML(spec Backend) map[string]any {
+	endpoints := spec.Endpoints
+	if len(endpoints) == 0 {
+		endpoints = []BackendEndpoint{{Address: spec.Address, Port: spec.Port, Weight: 1, Priority: 0}}
+	}
+
+	grouped := map[uint32][]BackendEndpoint{}
+	priorities := make([]int, 0)
+	seen := map[uint32]bool{}
+
+	for _, ep := range endpoints {
+		if ep.Weight == 0 {
+			ep.Weight = 1
+		}
+		if !seen[ep.Priority] {
+			priorities = append(priorities, int(ep.Priority))
+			seen[ep.Priority] = true
+		}
+		grouped[ep.Priority] = append(grouped[ep.Priority], ep)
+	}
+
+	sort.Ints(priorities)
+
+	localities := make([]any, 0, len(priorities))
+	for _, p := range priorities {
+		priority := uint32(p)
+		lbEndpoints := make([]any, 0, len(grouped[priority]))
+		for _, ep := range grouped[priority] {
+			lbEndpoints = append(lbEndpoints, buildStaticLbEndpointYAML(ep))
+		}
+
+		locality := map[string]any{"lb_endpoints": lbEndpoints}
+		if priority > 0 {
+			locality["priority"] = priority
+		}
+		localities = append(localities, locality)
+	}
+
+	return map[string]any{
+		"cluster_name": spec.Service,
+		"endpoints":    localities,
+	}
+}
+
+func buildStaticLbEndpointYAML(ep BackendEndpoint) map[string]any {
+	item := map[string]any{
+		"endpoint": map[string]any{
+			"address": map[string]any{
+				"socket_address": map[string]any{
+					"address":    ep.Address,
+					"port_value": ep.Port,
+				},
+			},
+		},
+	}
+	if ep.Weight > 0 {
+		item["load_balancing_weight"] = ep.Weight
+	}
+	return item
+}
+
+func buildStaticListenerYAML(spec ListenerSpec) (map[string]any, error) {
+	normalizeListenerProtocol(&spec)
+
+	filterChain := map[string]any{}
+	if listenerUsesHTTP(spec) {
+		hcmConfig, err := buildStaticHCMYAML(spec)
+		if err != nil {
+			return nil, err
+		}
+		filterChain["filters"] = []any{
+			map[string]any{
+				"name":         "envoy.filters.network.http_connection_manager",
+				"typed_config": hcmConfig,
+			},
+		}
+	} else if strings.EqualFold(spec.Protocol, "tcp") {
+		filterChain["filters"] = []any{
+			map[string]any{
+				"name": "envoy.filters.network.tcp_proxy",
+				"typed_config": map[string]any{
+					"@type":       "type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy",
+					"stat_prefix": spec.Name,
+					"cluster":     spec.Service,
+				},
+			},
+		}
+	} else {
+		return nil, fmt.Errorf("unsupported listener protocol %q", spec.Protocol)
+	}
+
+	if spec.TLS != nil && spec.TLS.Enabled {
+		filterChain["transport_socket"] = buildStaticDownstreamTransportSocketYAML(*spec.TLS)
+	}
+
+	return map[string]any{
+		"name": spec.Name,
+		"address": map[string]any{
+			"socket_address": map[string]any{
+				"address":    defaultString(spec.Address, "0.0.0.0"),
+				"port_value": spec.Port,
+			},
+		},
+		"filter_chains": []any{filterChain},
+	}, nil
+}
+
+func buildStaticHCMYAML(spec ListenerSpec) (map[string]any, error) {
+	httpFilters := make([]any, 0)
+	if routeConfigUsesLocalRateLimit(spec.RouteName) {
+		httpFilters = append(httpFilters, map[string]any{
+			"name": "envoy.filters.http.local_ratelimit",
+			"typed_config": map[string]any{
+				"@type":       "type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit",
+				"stat_prefix": spec.Name + "_http_local_rate_limiter",
+			},
+		})
+	}
+
+	httpFilters = append(httpFilters, map[string]any{
+		"name": "envoy.filters.http.router",
+		"typed_config": map[string]any{
+			"@type": "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router",
+		},
+	})
+
+	hcmConfig := map[string]any{
+		"@type":        "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
+		"stat_prefix":  spec.Name,
+		"route_config": buildStaticRouteConfigForListenerYAML(spec),
+		"http_filters": httpFilters,
+	}
+
+	if len(spec.UpgradeTypes) > 0 {
+		upgrades := make([]any, 0, len(spec.UpgradeTypes))
+		for _, upgrade := range spec.UpgradeTypes {
+			upgrades = append(upgrades, map[string]any{"upgrade_type": upgrade})
+		}
+		hcmConfig["upgrade_configs"] = upgrades
+	}
+
+	return hcmConfig, nil
+}
+
+func buildStaticRouteConfigForListenerYAML(listener ListenerSpec) map[string]any {
+	if cfg, ok := routeConfigs[listener.RouteName]; ok && len(cfg.Rules) > 0 {
+		return buildStaticRouteConfigYAML(cfg)
+	}
+
+	routeAction := map[string]any{
+		"cluster": listener.Service,
+		"timeout": "0s",
+	}
+	if backendUsesHostnameTargets(listener.Service) {
+		routeAction["auto_host_rewrite"] = true
+	}
+
+	return map[string]any{
+		"name": listener.RouteName,
+		"virtual_hosts": []any{
+			map[string]any{
+				"name":    "backend",
+				"domains": []string{"*"},
+				"routes": []any{
+					map[string]any{
+						"match": map[string]any{"prefix": "/"},
+						"route": routeAction,
+					},
+				},
+			},
+		},
+	}
+}
+
+func buildStaticRouteConfigYAML(spec RouteConfigSpec) map[string]any {
+	domains := spec.Domains
+	if len(domains) == 0 {
+		domains = []string{"*"}
+	}
+
+	routes := make([]any, 0, len(spec.Rules))
+	for i, rule := range spec.Rules {
+		if rule.LocalRateLimit != nil {
+			normalizeLocalRateLimit(rule.LocalRateLimit, spec.RouteName, i)
+		}
+		routes = append(routes, buildStaticRouteRuleYAML(rule))
+	}
+
+	return map[string]any{
+		"name": spec.RouteName,
+		"virtual_hosts": []any{
+			map[string]any{
+				"name":    "backend",
+				"domains": domains,
+				"routes":  routes,
+			},
+		},
+	}
+}
+
+func buildStaticRouteRuleYAML(rule RouteRule) map[string]any {
+	routeAction := map[string]any{"cluster": rule.Cluster}
+	if rule.TimeoutMS == 0 {
+		routeAction["timeout"] = "0s"
+	} else {
+		routeAction["timeout"] = fmt.Sprintf("%dms", rule.TimeoutMS)
+	}
+	if rule.PrefixRewrite != "" {
+		routeAction["prefix_rewrite"] = rule.PrefixRewrite
+	}
+	if rule.HostRewriteLiteral != "" {
+		routeAction["host_rewrite_literal"] = rule.HostRewriteLiteral
+	} else if rule.AutoHostRewrite || backendUsesHostnameTargets(rule.Cluster) {
+		routeAction["auto_host_rewrite"] = true
+	}
+	if rule.RetryPolicy != nil {
+		routeAction["retry_policy"] = buildStaticRetryPolicyYAML(*rule.RetryPolicy)
+	}
+
+	item := map[string]any{
+		"match": map[string]any{"prefix": rule.Prefix},
+		"route": routeAction,
+	}
+	if rule.LocalRateLimit != nil {
+		item["typed_per_filter_config"] = map[string]any{
+			"envoy.filters.http.local_ratelimit": buildStaticRouteLocalRateLimitYAML(*rule.LocalRateLimit),
+		}
+	}
+	return item
+}
+
+func buildStaticRetryPolicyYAML(spec RetryPolicySpec) map[string]any {
+	retryOn := spec.RetryOn
+	if retryOn == "" {
+		retryOn = "5xx,connect-failure,refused-stream,reset"
+	}
+	numRetries := spec.NumRetries
+	if numRetries == 0 {
+		numRetries = 3
+	}
+
+	policy := map[string]any{
+		"retry_on":    retryOn,
+		"num_retries": numRetries,
+	}
+	if spec.PerTryTimeoutMS > 0 {
+		policy["per_try_timeout"] = fmt.Sprintf("%dms", spec.PerTryTimeoutMS)
+	}
+	if len(spec.RetriableStatusCodes) > 0 {
+		policy["retriable_status_codes"] = spec.RetriableStatusCodes
+	}
+	if spec.HostSelectionRetryMaxAttempts > 0 {
+		policy["host_selection_retry_max_attempts"] = spec.HostSelectionRetryMaxAttempts
+	}
+	return policy
+}
+
+func buildStaticRouteLocalRateLimitYAML(spec LocalRateLimitSpec) map[string]any {
+	cfg := map[string]any{
+		"@type":       "type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit",
+		"stat_prefix": spec.StatPrefix,
+		"token_bucket": map[string]any{
+			"max_tokens":      spec.MaxTokens,
+			"tokens_per_fill": spec.TokensPerFill,
+			"fill_interval":   fmt.Sprintf("%dms", spec.FillIntervalMS),
+		},
+		"filter_enabled": map[string]any{
+			"default_value": map[string]any{
+				"numerator":   spec.EnabledPercent,
+				"denominator": "HUNDRED",
+			},
+		},
+		"filter_enforced": map[string]any{
+			"default_value": map[string]any{
+				"numerator":   spec.EnforcedPercent,
+				"denominator": "HUNDRED",
+			},
+		},
+	}
+	if spec.PerDownstreamConnection {
+		cfg["local_rate_limit_per_downstream_connection"] = true
+	}
+	if spec.ResponseHeaderKey != "" {
+		cfg["response_headers_to_add"] = []any{
+			map[string]any{
+				"header": map[string]any{
+					"key":   spec.ResponseHeaderKey,
+					"value": spec.ResponseHeaderValue,
+				},
+				"append_action": "OVERWRITE_IF_EXISTS_OR_ADD",
+			},
+		}
+	}
+	return cfg
+}
+
+func buildStaticHealthCheckYAML(spec HealthCheckSpec) map[string]any {
+	hc := map[string]any{
+		"timeout":             fmt.Sprintf("%dms", spec.TimeoutMS),
+		"interval":            fmt.Sprintf("%dms", spec.IntervalMS),
+		"healthy_threshold":   spec.HealthyThreshold,
+		"unhealthy_threshold": spec.UnhealthyThreshold,
+	}
+	if strings.EqualFold(spec.Type, "tcp") {
+		hc["tcp_health_check"] = map[string]any{}
+	} else {
+		hc["http_health_check"] = map[string]any{
+			"path": spec.Path,
+		}
+		if spec.Host != "" {
+			hc["http_health_check"].(map[string]any)["host"] = spec.Host
+		}
+	}
+	return hc
+}
+
+func buildStaticOutlierDetectionYAML(spec OutlierDetectionSpec) map[string]any {
+	return map[string]any{
+		"consecutive_5xx":      spec.Consecutive5xx,
+		"interval":             fmt.Sprintf("%dms", spec.IntervalMS),
+		"base_ejection_time":   fmt.Sprintf("%dms", spec.BaseEjectionMS),
+		"max_ejection_percent": spec.MaxEjectionPct,
+	}
+}
+
+func buildStaticCircuitBreakersYAML(specs []CircuitBreakersThresholdSpec) map[string]any {
+	thresholds := make([]any, 0, len(specs))
+	for _, spec := range specs {
+		threshold := map[string]any{"priority": defaultString(spec.Priority, "DEFAULT")}
+		if spec.MaxConnections > 0 {
+			threshold["max_connections"] = spec.MaxConnections
+		}
+		if spec.MaxPendingRequests > 0 {
+			threshold["max_pending_requests"] = spec.MaxPendingRequests
+		}
+		if spec.MaxRequests > 0 {
+			threshold["max_requests"] = spec.MaxRequests
+		}
+		if spec.MaxRetries > 0 {
+			threshold["max_retries"] = spec.MaxRetries
+		}
+		if spec.MaxConnectionPools > 0 {
+			threshold["max_connection_pools"] = spec.MaxConnectionPools
+		}
+		if spec.TrackRemaining {
+			threshold["track_remaining"] = true
+		}
+		if spec.RetryBudgetPercent > 0 {
+			threshold["retry_budget"] = map[string]any{
+				"budget_percent":        map[string]any{"value": float64(spec.RetryBudgetPercent)},
+				"min_retry_concurrency": spec.MinRetryConcurrency,
+			}
+		}
+		thresholds = append(thresholds, threshold)
+	}
+	return map[string]any{"thresholds": thresholds}
+}
+
+func buildStaticDownstreamTransportSocketYAML(cfg ListenerTLS) map[string]any {
+	normalizeListenerTLS(&cfg)
+	common := map[string]any{
+		"alpn_protocols": cfg.ALPNProtocols,
+		"tls_certificate_sds_secret_configs": []any{
+			map[string]any{
+				"name":       cfg.SecretName,
+				"sds_config": buildStaticPathConfigSourceYAML(cfg.SDSPath, cfg.WatchedDirectory),
+			},
+		},
+	}
+	if cfg.RequireClientCert {
+		common["validation_context_sds_secret_config"] = map[string]any{
+			"name": cfg.ValidationSecretName,
+			"sds_config": buildStaticPathConfigSourceYAML(
+				cfg.ValidationSDSPath,
+				watchedDir(cfg.ValidationSDSPath, cfg.WatchedDirectory),
+			),
+		}
+	}
+
+	typedConfig := map[string]any{
+		"@type":              "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext",
+		"common_tls_context": common,
+	}
+	if cfg.RequireClientCert {
+		typedConfig["require_client_certificate"] = true
+	}
+
+	return map[string]any{
+		"name":         "envoy.transport_sockets.tls",
+		"typed_config": typedConfig,
+	}
+}
+
+func buildStaticUpstreamTransportSocketYAML(cfg UpstreamTLS) map[string]any {
+	common := map[string]any{}
+	if cfg.TrustedCAFile != "" {
+		common["validation_context"] = map[string]any{
+			"trusted_ca": map[string]any{
+				"filename": cfg.TrustedCAFile,
+			},
+		}
+	}
+	if cfg.ClientCertFile != "" && cfg.ClientKeyFile != "" {
+		common["tls_certificates"] = []any{
+			map[string]any{
+				"certificate_chain": map[string]any{"filename": cfg.ClientCertFile},
+				"private_key":       map[string]any{"filename": cfg.ClientKeyFile},
+			},
+		}
+	}
+
+	typedConfig := map[string]any{
+		"@type":              "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
+		"common_tls_context": common,
+	}
+	if cfg.SNI != "" {
+		typedConfig["sni"] = cfg.SNI
+	}
+	if cfg.AutoHostSNI {
+		typedConfig["auto_host_sni"] = true
+	}
+	if cfg.AutoSNISANValidation {
+		typedConfig["auto_sni_san_validation"] = true
+	}
+
+	return map[string]any{
+		"name":         "envoy.transport_sockets.tls",
+		"typed_config": typedConfig,
+	}
+}
+
+func buildStaticPathConfigSourceYAML(path, watched string) map[string]any {
+	return map[string]any{
+		"resource_api_version": "V3",
+		"path_config_source": map[string]any{
+			"path": path,
+			"watched_directory": map[string]any{
+				"path": watched,
+			},
+		},
+	}
+}
+
+func defaultString(value string, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
 }
 
 func buildUnoProxyAdminURL(path string, query url.Values) (string, error) {
